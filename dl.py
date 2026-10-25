@@ -164,6 +164,78 @@ def is_block(line):
     return not NOT_BLOCK_RE.match(line) and bool(BLOCK_RE.search(URL_RE.sub("", line)))
 
 
+# ---------------------------------------------------------------------
+# COLOURS (screen only: dl.log and the error files stay plain text)
+# config.ini [display] color = auto | yes | no.  auto = on in a terminal, off when the output
+# goes to a file or NO_COLOR is set. Change the numbers below to change a colour.
+# Cyan for good and bold red for bad: easy to tell apart with most kinds of colour blindness.
+COLOR_ON = False
+PALETTE = {"ok": "36", "err": "1;31", "warn": "33", "bold": "1", "dim": "2"}
+
+
+def init_color(mode):
+    "Switch colours on or off for this process. On Windows this also enables ANSI codes."
+    global COLOR_ON
+    mode = (mode or "auto").lower()
+    if mode == "no" or os.environ.get("NO_COLOR") is not None and mode != "yes":
+        COLOR_ON = False
+        return
+    if mode == "auto" and (not sys.stdout.isatty() or os.environ.get("TERM") == "dumb"):
+        COLOR_ON = False
+        return
+    if os.name == "nt":
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            h = k.GetStdHandle(-11)
+            m = ctypes.c_uint()
+            ok = bool(k.GetConsoleMode(h, ctypes.byref(m))) and bool(k.SetConsoleMode(h, m.value | 0x0004))
+        except Exception:
+            ok = False
+        if not ok and mode == "auto":
+            COLOR_ON = False
+            return
+    COLOR_ON = True
+
+
+def paint(text, kind):
+    return f"\033[{PALETTE[kind]}m{text}\033[0m" if COLOR_ON else text
+
+
+_OK_START = ("Downloaded ", "Upgraded", "SoundCloud upgrade finished", "Moved ", "All passes finished",
+             "Created ", "No failed songs", "Nothing to clean up")
+_DIM_START = ("Skipped", "Skipping", "Found ", "Processing query", "Waiting ", "Saved ", "Checking ",
+              "Library check", "Nothing was moved")
+_WARN_START = ("SoundCloud failed", "No close match", "Kept the YouTube", "NOTE", "Note:", "Fallback")
+
+
+def colorize_line(line):
+    "Colour one line of output by what it says. Lines that already have colour are left alone."
+    if not COLOR_ON or "\033" in line:
+        return line
+    t = re.sub(r"^\[\d\d:\d\d\]\s*", "", line.strip())
+    if not t:
+        return line
+    if t.startswith(_WARN_START) or "WARNING" in t:
+        kind = "warn"
+    elif (t.startswith(("Reason:", "LookupError", "Traceback", "Stopped"))
+          or "ERROR" in t or "failed" in t.lower() and not t.startswith("No failed") or is_block(t)):
+        kind = "err"
+    elif t.startswith(_OK_START) or "Upgraded" in t or t.startswith("Pass ") and "finished" in t:
+        kind = "ok"
+    elif t.startswith(_DIM_START):
+        kind = "dim"
+    elif t.startswith("---") or re.match(r"Pass \d", t):
+        kind = "bold"
+    else:
+        return line
+    return paint(line, kind)
+
+
+def cprint(text=""):
+    print(colorize_line(text))
+
+
 LINK_ID_RE = re.compile(r"playlist[/:]([A-Za-z0-9]{22})")   # link or spotify: URI
 CHILD_ENV = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1")
 
@@ -495,6 +567,13 @@ auto_update = yes
 # To preview without moving:    dl.py --sort --dry-run
 sort_after_download = yes
 
+[display]
+# Coloured text on screen (cyan = good, yellow = warning, bold red = problem).
+# The log files never contain colours.
+# auto = colours in a terminal, none when the output goes to a file (or NO_COLOR is set).
+# yes = always. no = never. Default: auto
+color = auto
+
 [dedupe]
 # Duplicate songs, broken files and a library report. Nothing is ever deleted: extra
 # copies move to the folder _Duplicates inside music_dir. Delete that folder yourself.
@@ -647,6 +726,7 @@ def load_config():
         "audio": sources("audio_sources", ["youtube", "soundcloud"]),
         "prefer_sc": yes_no("prefer_soundcloud", True, "sources"),
         "auto_update": yes_no("auto_update", True, "updates"),
+        "color": cp.get("display", "color", fallback="auto").strip().lower() or "auto",
         "dd_preview": yes_no("preview_at_end", True, "dedupe"),
         "dd_fingerprint": yes_no("fingerprint", False, "dedupe"),
         "dd_cleanup": yes_no("cleanup", True, "dedupe"),
@@ -824,7 +904,8 @@ def run_playlist(cmd, cwd, log, max_block, marks=None):
                 if marks is not None:
                     marks.append(line.rstrip("\r\n")[6:])
                 continue
-            sys.stdout.write(line)
+            body = line.rstrip("\r\n")
+            sys.stdout.write(colorize_line(body) + line[len(body):])
             log.write(line)
             log.flush()
             if is_block(line):
@@ -1247,7 +1328,7 @@ def _upgrade_batches(todo, index, tmp, js, log, pending, mutagen_file):
                "--yt-dlp-args", yt_args(js, None, slow=False)]
         rc, _, _ = run_playlist(cmd, tmp, log, 10 ** 9, marks)
         if rc != 0:                              # spotDL crashed: keep this batch for next time
-            print(f"WARNING: spotDL stopped (exit code {rc}). The rest stays queued. "
+            cprint(f"WARNING: spotDL stopped (exit code {rc}). The rest stays queued. "
                   "Run  dl.py --upgrade  to try again.")
             break
         got = {}                                 # Spotify link -> (SoundCloud link, name)
@@ -1267,12 +1348,12 @@ def _upgrade_batches(todo, index, tmp, js, log, pending, mutagen_file):
                     shutil.move(str(f), str(stage))   # same folder first, so the swap is one step
                     os.replace(stage, index[u])
                     replaced += 1
-                    print(f"  Upgraded to SoundCloud: {name}")
+                    cprint(f"  Upgraded to SoundCloud: {name}")
                 except OSError as e:                  # file in use, disk full...: keep the old one
                     stage.unlink(missing_ok=True)
-                    print(f"  Kept the YouTube version of {name}: could not replace it ({e})")
+                    cprint(f"  Kept the YouTube version of {name}: could not replace it ({e})")
             else:
-                print(f"  Kept the YouTube version of {name}: {why}")
+                cprint(f"  Kept the YouTube version of {name}: {why}")
         rest = todo[i + UPGRADE_BATCH:]          # progress survives a stop
         pending.write_text("".join(u + "\n" for u in rest), encoding="utf-8")
     else:
@@ -1615,12 +1696,20 @@ def _dd_summary(recs, music_dir):
     ]
 
 
+def _dd_show(lines, kind=None):
+    "Print summary lines: the label before the first ':' in bold, the rest plain (or in kind)."
+    for line in lines:
+        label, sep, rest = line.partition(":")
+        print(paint(label + sep, "bold") + (paint(rest, kind) if kind else rest))
+
+
 def _dd_prompt(show):
     "Ask what to do after a preview. Returns 'apply' or 'exit'. show() prints the full list."
     while True:
         try:
-            ans = input("Type --expand to list the duplicates, --dedupe to move them, "
-                        "--exit to quit: ").strip().lower().lstrip("-")
+            print("Type " + paint("--expand", "bold") + " to list the duplicates, " + paint("--dedupe", "bold")
+                  + " to move them, " + paint("--exit", "bold") + " to quit")
+            ans = input("> ").strip().lower().lstrip("-")
         except (EOFError, KeyboardInterrupt):
             print()
             return "exit"
@@ -1696,8 +1785,8 @@ def run_dedupe(cfg, dry_run=False, report_only=False, ask=False):
         (state / "library-report.txt").write_text(library_report(recs, music_dir) + "\n", encoding="utf-8")
     summary = _dd_summary(recs, music_dir)
     if report_only:
-        print("\n".join(summary))
-        print(f"Saved to: {state}  (library-report.txt)")
+        _dd_show(summary)
+        _dd_show([f"Saved to: {state}  (library-report.txt)"])
         _dd_save_cache(cache_file, cache)
         return
 
@@ -1727,18 +1816,20 @@ def run_dedupe(cfg, dry_run=False, report_only=False, ask=False):
 
     def expand():
         for keeper, losers in plan:
-            print(f"  KEEP {short(keeper)}  ({keeper['kbps']} kbps)")
+            print(f"  {paint('KEEP', 'ok')} {short(keeper)}  ({keeper['kbps']} kbps)")
             for r, why in losers:
-                print(f"    MOVE {short(r)}  ({r['kbps']} kbps, {why})")
+                print(f"    {paint('MOVE', 'warn')} {short(r)}  ({r['kbps']} kbps, {why})")
         for f in junk:
-            print(f"  BROKEN/LEFTOVER {f}")
+            print(f"  {paint('BROKEN/LEFTOVER', 'warn')} {f}")
         for d in empty_dirs:
-            print(f"  EMPTY FOLDER {d}")
-    print("\n".join(summary))
-    print(f"Duplicates: {len(plan)} songs have extra copies ({moving} files to move)")
+            print(f"  {paint('EMPTY FOLDER', 'warn')} {d}")
+    _dd_show(summary)
+    _dd_show([f"Duplicates: {len(plan)} songs have extra copies ({moving} files to move)"],
+             "warn" if plan else "ok")
     if junk or empty_dirs:
-        print(f"Cleanup: {len(junk)} empty, unreadable or leftover files | {len(empty_dirs)} empty folders")
-    print(f"Saved to: {state}  (dedupe-report.txt, library-report.txt)")
+        _dd_show([f"Cleanup: {len(junk)} empty, unreadable or leftover files | {len(empty_dirs)} empty folders"],
+                 "warn")
+    _dd_show([f"Saved to: {state}  (dedupe-report.txt, library-report.txt)"])
 
     if dry_run:
         if not (moving or junk or empty_dirs):
@@ -1747,7 +1838,7 @@ def run_dedupe(cfg, dry_run=False, report_only=False, ask=False):
             return
         if ask:
             if _dd_prompt(expand) != "apply":
-                print("Nothing was moved.")
+                cprint("Nothing was moved.")
                 _dd_save_cache(cache_file, cache)
                 return
         else:
@@ -1782,8 +1873,8 @@ def run_dedupe(cfg, dry_run=False, report_only=False, ask=False):
                 break
             d = d.parent
     _dd_save_cache(cache_file, cache)
-    print(f"Moved {moved} duplicate files and {len(junk)} broken/leftover files to {music_dir / DUP_DIR}. "
-          f"Filled {merged} missing tags on kept copies. Delete {DUP_DIR} when you are happy.")
+    cprint(f"Moved {moved} duplicate files and {len(junk)} broken/leftover files to {music_dir / DUP_DIR}. "
+           f"Filled {merged} missing tags on kept copies. Delete {DUP_DIR} when you are happy.")
 
 
 def _dd_save_cache(path, cache):
@@ -1850,7 +1941,7 @@ def main():
 
     def say(msg):
         line = f"[{datetime.now():%H:%M}] {msg}"
-        print(line)
+        print(colorize_line(line))
         log.write(line + "\n")
         log.flush()
 
@@ -2043,6 +2134,7 @@ def main():
 if __name__ == "__main__":
     args = sys.argv[1:]
     try:
+        init_color(load_config()["color"])
         known = {"-h", "--help", "--sort", "--dry-run", "--upgrade", "--dedupe", "--report",
                  "--sort-inner", "--seed-inner", "--upgrade-inner", "--dedupe-inner", "--report-only",
                  "--no-ask"}

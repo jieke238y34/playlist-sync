@@ -32,6 +32,9 @@ cleans empty or broken files, fills a missing genre tag on the kept copy, and `-
 shows library stats. Optional audio fingerprints (`fingerprint = yes` in `[dedupe]`, downloads a
 small helper on Windows, Linux and macOS) find copies whose names differ.
 
+Output is coloured in a terminal (cyan = good, yellow = warning, bold red = problem). Log files stay
+plain. Set `color = no` under `[display]` in `config.ini` to turn it off, or use the `NO_COLOR` setting.
+
 Optional: node (fewer YouTube errors) and a cookies file (age-restricted songs).
 
 These three files are personal and listed in `.gitignore`.
