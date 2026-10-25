@@ -2,6 +2,7 @@
 Run:  python -m unittest discover -s tests -v
 """
 import importlib.util
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -237,6 +238,7 @@ class Display(unittest.TestCase):
     def test_fmt_secs(self):
         self.assertEqual(dl._fmt_secs(30), "under 1 min")
         self.assertEqual(dl._fmt_secs(3600 * 5 + 120), "5 h 2 min")
+        self.assertEqual(dl._fmt_secs(3600 * 60), "2 days 12 h")
 
     def test_clean_name(self):
         self.assertEqual(dl._clean_name("NUL"), "_NUL")
@@ -244,6 +246,26 @@ class Display(unittest.TestCase):
 
 
 class Eta(unittest.TestCase):
+    def test_unread_playlists_are_not_assumed_huge(self):
+        with tempfile.TemporaryDirectory() as d:
+            eta = dl.Eta(Path(d), 120)
+            eta.begin_pass([f"p{i}" for i in range(93)])
+            eta.begin_playlist(1, "p0")
+            eta.line("Found 10237 songs in Big (Playlist)")
+            text = eta.line("DL-PLAN 7092")
+            self.assertIn("92 playlists not read yet", text)
+            m = re.search(r"about (?:(\d+) days )?(?:(\d+) h)?", text)
+            hours = int(m.group(1) or 0) * 24 + int(m.group(2) or 0)
+            self.assertLess(hours, 400)                   # the old bug said 5499 hours
+
+    def test_eta_line_is_yellow(self):
+        old = dl.COLOR_ON
+        dl.COLOR_ON = True
+        try:
+            self.assertTrue(dl.colorize_line("ETA about 2 h left").startswith("\033[" + dl.PALETTE["warn"]))
+        finally:
+            dl.COLOR_ON = old
+
     def test_line(self):
         with tempfile.TemporaryDirectory() as d:
             eta = dl.Eta(Path(d), 120)

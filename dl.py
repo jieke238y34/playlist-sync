@@ -391,7 +391,7 @@ def paint(text, kind):
 
 _OK_START = ("Downloaded ", "Upgraded", "SoundCloud upgrade finished", "Moved ", "All passes finished",
              "Created ", "No failed songs", "Nothing to clean up")
-_DIM_START = ("ETA", "Playlist files", "Skipped", "Skipping", "Found ", "Processing query", "Waiting ", "Saved ", "Checking ",
+_DIM_START = ("Playlist files", "Skipped", "Skipping", "Found ", "Processing query", "Waiting ", "Saved ", "Checking ",
               "Library check", "Nothing was moved")
 _WARN_START = ("SoundCloud failed", "No close match", "Kept the YouTube", "NOTE", "Note:", "Fallback")
 
@@ -403,8 +403,8 @@ def colorize_line(line):
     t = re.sub(r"^\[\d\d:\d\d\]\s*", "", line.strip())
     if not t:
         return line
-    if t.startswith(_WARN_START) or "WARNING" in t:
-        kind = "warn"
+    if t.startswith(_WARN_START) or t.startswith("ETA ") or "WARNING" in t:
+        kind = "warn"                                                   # warnings and the ETA line: yellow
     elif (t.startswith(("Reason:", "LookupError", "Traceback", "Stopped"))
           or "ERROR" in t or "failed" in t.lower() and not t.startswith("No failed") or is_block(t)):
         kind = "err"
@@ -1212,6 +1212,8 @@ def test_download(py, js, ffmpeg, cookies=None):
 def _fmt_secs(sec):
     m = int(sec) // 60
     h, m = divmod(m, 60)
+    if h >= 48:
+        return f"{h // 24} days {h % 24} h"
     return f"{h} h {m} min" if h else (f"{m} min" if m else "under 1 min")
 
 
@@ -1260,18 +1262,21 @@ class Eta:
         return None
 
     def text(self):
-        per = sum(self.rates) / len(self.rates) if self.rates else 30.0
+        per = sum(self.rates) / len(self.rates) if self.rates else 45.0
         cur_new = self.new if self.new is not None else (self.found or 0)
         later = self.todo[self.pos:]
-        known = list(self.sizes.values())
-        avg = sum(known) / len(known) if known else 30
+        known = sorted(self.sizes[p] for p in self.todo if p in self.sizes)
+        guess = known[len(known) // 2] if len(known) >= 5 else 150      # unread playlists: the typical size
+        unread = sum(1 for p in later if p not in self.sizes)
         seen = self.found_sum + (self.found or 0)
-        ratio = (self.new_sum + cur_new) / seen if seen else 1.0   # how many songs are really new
-        songs = max(0, cur_new - self.done) + sum(self.sizes.get(p, avg) for p in later) * ratio
+        ratio = min(1.0, max(0.05, (self.new_sum + cur_new) / seen)) if seen else 1.0   # how many songs are really new
+        songs = max(0, cur_new - self.done) + sum(self.sizes.get(p, guess) for p in later) * ratio
         secs = songs * per + len(later) * self.pause
         end = datetime.now() + timedelta(seconds=secs)
-        return (f"ETA about {_fmt_secs(secs)} left in this pass (done around {end:%H:%M}) | playlist "
-                f"{self.pos}/{len(self.todo)} | {self.done} of {cur_new} new songs | ~{per:.0f} s/song (rough)")
+        when = f"{end:%H:%M}" if end.date() == datetime.now().date() else f"{end:%a %d %b %H:%M}"
+        guessed = f" | {unread} playlists not read yet (guessed)" if unread else ""
+        return (f"ETA about {_fmt_secs(secs)} left in this pass (done around {when}) | playlist "
+                f"{self.pos}/{len(self.todo)} | {self.done} of {cur_new} new songs | ~{per:.0f} s/song (rough){guessed}")
 
 
 def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
