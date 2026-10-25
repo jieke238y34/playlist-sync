@@ -1,5 +1,10 @@
 # dl.py
 
+[![tests](https://github.com/jieke238y34/playlist-sync/actions/workflows/tests.yml/badge.svg)](https://github.com/jieke238y34/playlist-sync/actions/workflows/tests.yml)
+[![License: GPL v2](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
+![Python 3.10 to 3.14](https://img.shields.io/badge/python-3.10%20to%203.14-blue.svg)
+![Windows, Linux, macOS](https://img.shields.io/badge/platform-windows%20%7C%20linux%20%7C%20macos-lightgrey.svg)
+
 Download your Spotify playlists as MP3 files, sort them into genre folders, find and clean up
 duplicates, and keep the best quality. One Python file, nothing to install by hand.
 Works on Windows, Linux and macOS. It was developed and tested on Linux.
