@@ -22,3 +22,7 @@ spotDL and yt-dlp into a private folder and downloads ffmpeg if the system has n
 Optional: node (fewer YouTube errors) and a cookies file (age-restricted songs).
 
 These three files are personal and listed in `.gitignore`.
+
+## License
+
+GNU General Public License, version 2. See [LICENSE](LICENSE).
