@@ -23,6 +23,9 @@ COMMANDS
     python3 dl.py                   download, then sort into genre folders
     python3 dl.py --sort            sort only
     python3 dl.py --sort --dry-run  preview the sort, move nothing
+    python3 dl.py --dedupe          move duplicate songs to _Duplicates (nothing is deleted)
+    python3 dl.py --dedupe --dry-run  preview the duplicates only
+    python3 dl.py --report          library report (sizes, formats, weakest files)
     python3 dl.py --upgrade         SoundCloud upgrade only (songs still waiting from earlier runs)
     python3 dl.py --help            show this text
 
@@ -31,6 +34,14 @@ SOURCES
     file replaces the YouTube file only if it is not DRM protected, is about as long, is at least
     60 s and is not a cover, remix or live version. Switch it off in config.ini
     ([sources] prefer_soundcloud = no).
+
+DUPLICATES
+    At the end of every run, dl.py previews duplicate songs (same artist, title and length,
+    or the same Spotify link) but moves nothing. To move them, run:  python3 dl.py --dedupe
+    The best copy stays (lossless, higher bitrate, cover art, full tags). Live, remix and
+    other versions are kept. Extra copies go to <music_dir>/_Duplicates. Also cleans empty
+    or broken files and empty folders, fills a missing genre tag on the kept copy, and writes
+    a library report. Optional audio fingerprints: config.ini [dedupe] fingerprint = yes.
 
 SPEED
     To avoid YouTube blocks, yt-dlp waits 15 to 40 seconds between tracks. Large
@@ -41,16 +52,22 @@ OPTIONAL
     cookies file       - helps with age-restricted songs
 """
 import configparser
+import hashlib
+import json
 import os
+import platform
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import traceback
+import urllib.request
 import venv
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -262,16 +279,27 @@ try:
                       + song.display_name, flush=True)
         return None, None
     import os as _os
-    import bisect as _bisect
     _EXT = {".mp3", ".m4a", ".flac", ".ogg", ".opus", ".wav"}
     _lib = {}
     def _norm(t):
-        return " ".join(_re.findall(r"[a-z0-9]+", (t or "").lower()))
+        return " ".join(_re.findall(r"[^\W_]+", (t or "").lower()))
+    _NZ = _re.compile(r"\b(?:\d{4}\s+)?(?:digital\s+)?(?:remaster(?:ed)?|mono|stereo)\b(?:\s+(?:19|20)\d\d)?(?:\s+version)?")
+    _VW = _re.compile(r"\b(live|remix|acoustic|instrumental|karaoke|slowed|sped|nightcore|8d|demo|cover|edit|bootleg|mashup|reverb|unplugged|extended|radio|mix|dub|orchestral|piano|cappella|version|reprise|medley|session|remake|rework|flip)\b")
+    def _core(t):
+        "Title and artist without remaster tags and (feat. ...) brackets. Live, remix... stay."
+        s = _NZ.sub(" ", (t or "").lower())
+        s = _re.sub(r"[\(\[]\s*(?:(?:feat|ft|featuring|with|prod|from|remaster|remastered|deluxe|explicit|clean|bonus|mono|stereo|single|album)\b[^\)\]]*)?[\)\]]", " ", s)   # only harmless brackets go
+        s = _re.sub(r"\b(?:feat|ft|featuring)\b\.?[^-]*", " ", s)
+        return " ".join(_re.findall(r"[^\W_]+", s))
+    def _ak(t):
+        "First artist only: files can hold 'A, B', Spotify gives the first one."
+        return _norm(_re.split(r"\s*(?:[;,&/]|\bfeat\b\.?)\s*", (t or "").lower())[0])
     def _keys():
-        "Sorted 'title artist' keys of every audio file in all folders (built once per run of spotDL)."
+        "Set of 'title|first artist' keys of every song file (plain and cleaned). Built once."
         if "k" not in _lib:
             ks, seen = set(), set()
             for d, dirs, files in _os.walk(".", followlinks=True):   # spotDL runs in the music folder
+                dirs[:] = [x for x in dirs if x != "_Duplicates" and not x.startswith(".")]
                 real = _os.path.realpath(d)
                 if real in seen:                     # a folder link that loops: stop here
                     dirs[:] = []
@@ -280,17 +308,19 @@ try:
                 for f in files:
                     stem, ext = _os.path.splitext(f)
                     if ext.lower() in _EXT:
-                        parts = stem.split(" - ")
-                        ks.add(_norm(stem))
-                        for n in range(2, len(parts) + 1):   # titles can hold " - " too
-                            ks.add(_norm(" - ".join(parts[:n])))
-            _lib["k"] = sorted(ks)
+                        parts = stem.split(" - ")    # Title - Artist - Album. A title can hold " - ".
+                        for n in range(1, len(parts)):
+                            title, artist = " - ".join(parts[:n]), _ak(parts[n])
+                            ks.add(_norm(title) + "|" + artist)
+                            ks.add(_core(title) + "|" + artist)
+            _lib["k"] = ks
         return _lib["k"]
     def _have(song):
-        key = _norm((song.name or "") + " " + (song.artist or ""))
+        art = _ak(song.artist)
+        if not art:
+            return False
         ks = _keys()
-        i = _bisect.bisect_left(ks, key)
-        return bool(key) and i < len(ks) and (ks[i] == key or ks[i].startswith(key + " "))
+        return any(k and k + "|" + art in ks for k in (_norm(song.name), _core(song.name)))
     _o_dms = _D.Downloader.download_multiple_songs
     def _dms(self, songs):
         try:
@@ -463,6 +493,35 @@ auto_update = yes
 # To sort without downloading:  dl.py --sort
 # To preview without moving:    dl.py --sort --dry-run
 sort_after_download = yes
+
+[dedupe]
+# Duplicate songs, broken files and a library report. Nothing is ever deleted: extra
+# copies move to the folder _Duplicates inside music_dir. Delete that folder yourself.
+# Same song = same Spotify link, or same artist + title + about the same length.
+# Live, remix, acoustic... versions are different songs and stay.
+# The best copy stays: lossless, then higher bitrate, then cover art, then full tags.
+#   Preview now:  dl.py --dedupe --dry-run       Move the copies:  dl.py --dedupe
+#   Report only:  dl.py --report
+
+# yes = at the end of every run, show the duplicates that were found. Moves nothing.
+# no = never show it (you can still run dl.py --dedupe yourself).
+preview_at_end = yes
+
+# yes = also compare the sound of songs by the same artist. Finds copies whose names
+# differ. The first run is slow (about 0.3 s per song, saved afterwards). It downloads
+# a small helper (fpcalc, about 2 MB) once. Works on Windows, Linux and macOS.
+fingerprint = no
+
+# yes = move empty or unreadable song files and leftover .new files to _Duplicates/_Broken,
+# and remove empty folders inside the genre folders.
+cleanup = yes
+
+# yes = when a copy moves away, give the kept copy its genre if it has none.
+merge_tags = yes
+
+# yes = write library-report.txt (song count, size, formats, weakest files) when you run
+# --dedupe or --report.
+library_report = yes
 """
 
 PLAYLISTS_TEMPLATE = """\
@@ -497,6 +556,19 @@ PLAYLISTS_TEMPLATE = """\
 #   - Lines that start with # are ignored. Do not remove the # signs.
 #   - Quotes, commas and spaces around a link or ID are removed for you.
 #   - Duplicates are ignored. Bad lines are skipped with a message.
+#   - You can add a note after a link, behind a #. Example:
+#       1r9DRLBzZqkPU0aDBVycY8   # road trip mix
+#
+# GOOD TO KNOW
+#   - Playlists download from top to bottom. Put the ones you want first at the top.
+#   - Safe to run again and again: songs you already have are skipped, so only new
+#     songs download. Add new playlists at the bottom whenever you like.
+#   - New here? Try ONE small playlist first, then add the rest.
+#   - Each song is looked up on YouTube first, then SoundCloud. If SoundCloud has a good
+#     version it replaces the YouTube one. See [sources] in config.ini.
+#   - At the end of a run the script lists duplicate songs but moves nothing.
+#     Move them with:  python3 dl.py --dedupe    (see [dedupe] in config.ini)
+#   - Other commands:  --sort  --dedupe  --report  --upgrade  (python3 dl.py --help)
 #
 # >>>>>>>>>>>>>>>>  ADD YOUR PLAYLISTS BELOW THIS LINE  <<<<<<<<<<<<<<<<
 
@@ -574,6 +646,11 @@ def load_config():
         "audio": sources("audio_sources", ["youtube", "soundcloud"]),
         "prefer_sc": yes_no("prefer_soundcloud", True, "sources"),
         "auto_update": yes_no("auto_update", True, "updates"),
+        "dd_preview": yes_no("preview_at_end", True, "dedupe"),
+        "dd_fingerprint": yes_no("fingerprint", False, "dedupe"),
+        "dd_cleanup": yes_no("cleanup", True, "dedupe"),
+        "dd_merge": yes_no("merge_tags", True, "dedupe"),
+        "dd_report": yes_no("library_report", True, "dedupe"),
     }
 
 
@@ -1202,6 +1279,471 @@ def _upgrade_batches(todo, index, tmp, js, log, pending, mutagen_file):
     return replaced
 
 
+# ---------------------------------------------------------------------
+# DUPLICATES, CLEANUP AND LIBRARY REPORT
+#   dl.py --dedupe            move duplicate songs to _Duplicates (nothing is deleted)
+#   dl.py --dedupe --dry-run  only show what would move
+#   dl.py --report            only the library report
+# Same song = same Spotify link, or same artist + title + about the same length.
+# Live, remix, acoustic... versions are other songs and stay. The best copy stays:
+# lossless first, then the higher bitrate, then cover art, then complete tags, then the
+# copy that is already in a genre folder, then the oldest file.
+# Optional (config.ini [dedupe] fingerprint = yes): audio fingerprints also find copies
+# whose names differ. They are compared between songs of the same artist.
+BROKEN_DIR = "_Broken"           # inside _Duplicates: empty or unreadable files, leftovers
+FP_URL = "https://github.com/acoustid/chromaprint/releases/download/v1.5.1/chromaprint-fpcalc-1.5.1-"
+FP_SHA256 = {                               # of the files at FP_URL, so a changed download is refused
+    "windows-x86_64.zip": "36b478e16aa69f757f376645db0d436073a42c0097b6bb2677109e7835b59bbc",
+    "linux-x86_64.tar.gz": "4d7433a7f778e5946d7225230681cbcd634e153316ecac87c538c33ac32387a5",
+    "macos-universal.tar.gz": "d4d8faff4b5f7c558d9be053da47804f9501eaa6c2f87906a9f040f38d61c860",
+}
+_DD_NOISE = re.compile(r"\b(?:\d{4}\s+)?(?:digital\s+)?(?:remaster(?:ed)?|mono|stereo)\b"
+                       r"(?:\s+(?:19|20)\d\d)?(?:\s+version)?")
+_DD_VERSION = re.compile(
+    r"\b(live|remix|acoustic|instrumental|karaoke|slowed|sped|nightcore|8d|demo|cover|edit|"
+    r"bootleg|mashup|reverb|unplugged|extended|radio|mix|dub|orchestral|piano|cappella|"
+    r"version|reprise|medley|session|remake|rework|flip)\b")
+
+
+def _dd_flags(title):
+    "The version words in a title (live, remix...). Two copies must have the same ones."
+    return frozenset(_DD_VERSION.findall(_DD_NOISE.sub(" ", title.lower())))
+
+
+def _dd_core(title):
+    "Title for matching: no remaster tags, no (feat. ...) brackets. (Live), (Remix), (Part 2) stay."
+    s = _DD_NOISE.sub(" ", title.lower())
+    s = re.sub(r"[\(\[]\s*(?:(?:feat|ft|featuring|with|prod|from|remaster|remastered|deluxe|explicit|clean|bonus|mono|stereo|single|album)\b[^\)\]]*)?[\)\]]", " ", s)   # only harmless brackets go
+    s = re.sub(r"\b(?:feat|ft|featuring)\b\.?[^-]*", " ", s)
+    return " ".join(re.findall(r"[^\W_]+", s))
+
+
+def _dd_artist(artist):
+    "The first artist, in lower case, for matching."
+    first = re.split(r"\s*(?:[;,/&]|\bfeat\b\.?|\bft\b\.?|\bx\b)\s*", artist.lower())[0]
+    return " ".join(re.findall(r"[^\W_]+", first))
+
+
+def _dd_probe(mutagen_file, path):
+    "Facts about one song file. None = broken file. False = could not look right now."
+    try:
+        st = path.stat()
+        audio = mutagen_file(path, easy=True)
+    except OSError:
+        return False                             # locked or busy right now: look again next time
+    except Exception:
+        return None
+    try:
+        if audio is None or audio.info is None:
+            return None
+        tags = audio.tags or {}
+
+        def one(key):
+            v = tags.get(key) or [""]
+            return str(v[0]).strip()
+        length = float(audio.info.length)
+        kbps = (getattr(audio.info, "bitrate", 0) or 0) / 1000
+        if not kbps and length:
+            kbps = st.st_size * 8 / length / 1000
+        return {"size": st.st_size, "mtime": st.st_mtime, "len": length, "kbps": round(kbps),
+                "ll": path.suffix.lower() in (".flac", ".wav"), "artist": one("artist") or one("albumartist"),
+                "title": one("title"), "album": one("album"), "genre": one("genre"),
+                "url": _spotify_url(mutagen_file, path) or ""}
+    except Exception:
+        return None
+
+
+def _dd_has_cover(mutagen_file, path):
+    try:
+        audio = mutagen_file(path)
+        tags = audio.tags
+        if tags is not None and hasattr(tags, "getall"):
+            return bool(tags.getall("APIC"))
+        if tags is not None and "covr" in tags:
+            return bool(tags["covr"])
+        return bool(getattr(audio, "pictures", None)) or (tags is not None and "metadata_block_picture" in tags)
+    except Exception:
+        return False
+
+
+def ensure_fpcalc(state_dir):
+    "Path to Chromaprint's fpcalc: from the system, or downloaded once into state_dir. None if not possible."
+    found = shutil.which("fpcalc")
+    if found:
+        return Path(found)
+    exe = "fpcalc.exe" if IS_WIN else "fpcalc"
+    local = state_dir / "fpcalc" / exe
+    if local.is_file():
+        return local
+    machine = platform.machine().lower()
+    intel = machine in ("x86_64", "amd64")
+    if IS_WIN and intel:
+        asset = "windows-x86_64.zip"
+    elif sys.platform == "darwin":
+        asset = "macos-universal.tar.gz"
+    elif sys.platform.startswith("linux") and intel:
+        asset = "linux-x86_64.tar.gz"
+    else:
+        print("Fingerprints: no fpcalc download for this system. Install Chromaprint (fpcalc) "
+              "yourself, then run again.")
+        return None
+    try:
+        print("Fingerprints: downloading fpcalc (Chromaprint, about 2 MB, one time)...")
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            archive = Path(d) / asset
+            with urllib.request.urlopen(FP_URL + asset, timeout=60) as resp:
+                blob = resp.read(20_000_001)
+            if len(blob) > 20_000_000 or hashlib.sha256(blob).hexdigest() != FP_SHA256[asset]:
+                raise OSError("the download does not match the expected checksum")
+            archive.write_bytes(blob)
+            data = None
+            if asset.endswith(".zip"):
+                with zipfile.ZipFile(archive) as z:
+                    for info in z.infolist():
+                        if info.filename.rsplit("/", 1)[-1] == exe and info.file_size < 50_000_000:
+                            data = z.read(info)
+            else:
+                with tarfile.open(archive) as t:
+                    for m in t.getmembers():
+                        if m.isfile() and m.name.rsplit("/", 1)[-1] == exe and m.size < 50_000_000:
+                            data = t.extractfile(m).read()
+        if not data:
+            raise OSError("fpcalc not found in the download")
+        local.parent.mkdir(parents=True, exist_ok=True)
+        part = local.with_name(exe + ".part")    # write fully, then rename: no half-written program
+        part.write_bytes(data)
+        part.chmod(0o755)
+        os.replace(part, local)
+        return local
+    except Exception as e:
+        print(f"Fingerprints: could not get fpcalc ({e}). Continuing without fingerprints.")
+        return None
+
+
+def _dd_fingerprint(fpcalc, path):
+    try:
+        r = subprocess.run([str(fpcalc), "-raw", "-length", "120", "-json", str(path)],
+                           capture_output=True, text=True, timeout=180)
+        return [int(x) & 0xFFFFFFFF for x in json.loads(r.stdout).get("fingerprint", [])]
+    except Exception:
+        return None                              # fpcalc crashed or timed out: try again next run
+
+
+def _dd_same_audio(a, b):
+    "True if two raw fingerprints are the same recording (tries a few small shifts)."
+    if len(set(a[:400])) < 200 or len(set(b[:400])) < 200:
+        return False                             # silence or a repeating sound: tells nothing
+    best = 0.0
+    for shift in range(-3, 4):
+        x, y = a[max(0, shift):][:400], b[max(0, -shift):][:400]
+        n = min(len(x), len(y))
+        if n < 300:                              # about 37 s of sound at least
+            continue
+        diff = sum((p ^ q).bit_count() for p, q in zip(x, y))
+        best = max(best, 1 - diff / (32 * n))
+    return best >= 0.85
+
+
+def find_duplicate_groups(recs, use_fp=False):
+    "Groups of copies of the same song. recs: list of dicts from _dd_probe (plus 'fp' when known)."
+    parent = list(range(len(recs)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+    by_url, by_key, by_artist = {}, {}, {}
+    for i, r in enumerate(recs):
+        if r["url"]:
+            if r["url"] in by_url:
+                union(by_url[r["url"]], i)
+            else:
+                by_url[r["url"]] = i
+        title = r["title"] or r["name"].split(" - ")[0]
+        artist, core = _dd_artist(r["artist"]), _dd_core(title)
+        if artist and core:
+            by_key.setdefault((artist, core, _dd_flags(title)), []).append(i)
+            by_artist.setdefault(artist, []).append(i)
+    for idx in by_key.values():                  # same title: lengths must be close
+        idx.sort(key=lambda i: recs[i]["len"])
+        for a, b in zip(idx, idx[1:]):
+            if recs[b]["len"] - recs[a]["len"] <= max(3.0, 0.02 * recs[b]["len"]):
+                union(a, b)
+    for idx in by_artist.values():               # fingerprints: names may differ
+        idx = [i for i in idx if use_fp and recs[i].get("fp")]
+        for n, a in enumerate(idx):
+            for b in idx[n + 1:]:
+                if (find(a) != find(b) and abs(recs[a]["len"] - recs[b]["len"]) <= 2
+                        and _dd_flags(recs[a]["title"] or recs[a]["name"]) == _dd_flags(recs[b]["title"] or recs[b]["name"])
+                        and _dd_same_audio(recs[a]["fp"], recs[b]["fp"])):
+                    union(a, b)
+    groups = {}
+    for i in range(len(recs)):
+        groups.setdefault(find(i), []).append(recs[i])
+    return [g for g in groups.values() if len(g) > 1]
+
+
+def _dd_rank(r, cover, music_dir):
+    tags = sum(1 for k in ("artist", "title", "album", "genre", "url") if r[k])
+    in_folder = Path(r["p"]).parent != music_dir
+    return (r["ll"], r["kbps"], cover, tags, in_folder, -r["mtime"])
+
+
+_DD_WHY = ("lossy copy of a lossless file", "lower bitrate", "no cover art", "fewer tags",
+           "not in a genre folder", "newer file")
+
+
+def _dd_reason(best, other, music_dir):
+    for n, (x, y) in enumerate(zip(best, other)):
+        if x != y:
+            return _DD_WHY[n]
+    return "same quality"
+
+
+def _dd_unique(path):
+    if not path.exists():
+        return path
+    n = 2
+    while path.with_name(f"{path.stem} ({n}){path.suffix}").exists():
+        n += 1
+    return path.with_name(f"{path.stem} ({n}){path.suffix}")
+
+
+def _dd_move(src, music_dir, sub=""):
+    "Move src into _Duplicates (same folder layout). Never overwrites."
+    dest = music_dir / DUP_DIR / sub / src.relative_to(music_dir)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest = _dd_unique(dest)
+    shutil.move(str(src), str(dest))
+    return dest
+
+
+def _dd_merge_tags(mutagen_file, keeper, others):
+    "Give the kept copy a genre if it has none and a copy that moves away has one."
+    try:
+        audio = mutagen_file(keeper, easy=True)
+        if audio is None or (audio.tags and audio.tags.get("genre")):
+            return 0
+        genre = None
+        for o in others:
+            try:
+                genre = (mutagen_file(o, easy=True).tags or {}).get("genre")
+            except Exception:
+                genre = None
+            if genre:
+                break
+        if not genre:
+            return 0
+        if audio.tags is None:
+            audio.add_tags()
+        audio.tags["genre"] = genre
+        if keeper.suffix.lower() == ".mp3":       # keep the ID3 version the file already has
+            from mutagen.id3 import ID3
+            v = ID3(keeper).version[1]
+            audio.save(v2_version=v if v in (3, 4) else 4)
+        else:
+            audio.save()
+        return 1
+    except Exception as e:
+        print(f"  Could not update the genre of {keeper.name}: {e}")
+        return 0
+
+
+def _dd_walk(music_dir):
+    "(leftover .new files, empty folders two levels down or deeper). Skips _Duplicates and hidden folders."
+    new, empty = [], []
+    for d, dirs, files in os.walk(music_dir, topdown=True):
+        dirs[:] = [x for x in dirs if x != DUP_DIR and not x.startswith(".")]
+        new += [Path(d) / f for f in files if f.endswith(".new")]
+    for d, dirs, files in os.walk(music_dir, topdown=False):
+        p = Path(d)
+        rel = p.relative_to(music_dir).parts
+        if len(rel) >= 2 and DUP_DIR not in rel and not any(x.startswith(".") for x in rel):
+            if not os.listdir(d):
+                empty.append(p)
+    return new, empty
+
+
+def library_report(recs, music_dir):
+    "Text with counts, sizes and the weakest files."
+    lines = []
+    total = sum(r["size"] for r in recs)
+    lines.append(f"Songs: {len(recs)}   Size: {total / 1e9:.1f} GB   Hours: {sum(r['len'] for r in recs) / 3600:.0f}")
+    kinds, folders = {}, {}
+    for r in recs:
+        p = Path(r["p"])
+        kinds[p.suffix.lower()] = kinds.get(p.suffix.lower(), 0) + 1
+        rel = p.relative_to(music_dir).parts
+        folders[rel[0] if len(rel) > 1 else "(not sorted)"] = folders.get(rel[0] if len(rel) > 1 else "(not sorted)", 0) + 1
+    lines.append("Formats: " + ", ".join(f"{k} {v}" for k, v in sorted(kinds.items(), key=lambda x: -x[1])))
+    lines.append("Folders: " + ", ".join(f"{k} {v}" for k, v in sorted(folders.items(), key=lambda x: -x[1])[:15]))
+    low = sorted((r for r in recs if not r["ll"] and 0 < r["kbps"] < 128), key=lambda r: r["kbps"])
+    lines.append(f"Low quality (under 128 kbps): {len(low)}")
+    lines += [f"   {r['kbps']:>4} kbps  {Path(r['p']).name}" for r in low[:10]]
+    nog = sum(1 for r in recs if not r["genre"])
+    nourl = sum(1 for r in recs if not r["url"])
+    lines.append(f"No genre tag: {nog}   No Spotify link in tags: {nourl}")
+    return "\n".join(lines)
+
+
+def run_dedupe(cfg, dry_run=False, report_only=False):
+    "Runs inside the private venv (it has mutagen)."
+    try:
+        from mutagen import File as mutagen_file
+    except ImportError:
+        print("Duplicates: mutagen is missing. Run dl.py once to install it.")
+        return
+    music_dir, state = cfg["music_dir"], cfg["state_dir"]
+    state.mkdir(parents=True, exist_ok=True)
+    cache_file = state / "dedupe-cache.json"
+    try:                                         # version 2: files = {path: [mtime, size, facts]}
+        raw = json.loads(cache_file.read_text(encoding="utf-8"))
+        cache = raw["files"] if raw.get("v") == 2 else {}
+    except (OSError, ValueError, KeyError, AttributeError):
+        cache = {}
+    files = [f for f in audio_files(music_dir)
+             if DUP_DIR not in f.relative_to(music_dir).parts
+             and not any(x.startswith(".") for x in f.relative_to(music_dir).parts)]
+    print(f"Duplicates: reading {len(files)} songs...")
+    recs, broken, fresh = [], [], 0
+    for n, f in enumerate(files, 1):
+        key = str(f)
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        hit = cache.get(key)
+        if hit and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+            r = hit[2]
+        else:
+            r = _dd_probe(mutagen_file, f)
+            if r is False:
+                continue
+            if r is not None:
+                r["fp"] = None
+            fresh += 1
+            cache[key] = [st.st_mtime_ns, st.st_size, r]
+        if r is None or r["size"] == 0:
+            broken.append(f)
+            continue
+        r = dict(r)
+        r["p"], r["name"] = key, f.stem
+        recs.append(r)
+        if fresh and n % 500 == 0:
+            print(f"  {n} of {len(files)}...")
+    if cfg["dd_fingerprint"] and not report_only:
+        fpcalc = ensure_fpcalc(state)
+        if fpcalc:
+            need = [r for r in recs if r.get("fp") is None]
+            if need:
+                print(f"Fingerprints: reading {len(need)} songs (first run is slow, the result is saved)...")
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(4) as ex:
+                    for r, fp in zip(need, ex.map(lambda r: _dd_fingerprint(fpcalc, Path(r["p"])), need)):
+                        r["fp"] = fp
+                        if fp is not None:
+                            cache[r["p"]][2]["fp"] = fp
+
+    if cfg["dd_report"] or report_only:
+        text = library_report(recs, music_dir)
+        (state / "library-report.txt").write_text(text + "\n", encoding="utf-8")
+        print("--- library report ---\n" + text + f"\n(saved to {state / 'library-report.txt'})")
+    if report_only:
+        _dd_save_cache(cache_file, cache)
+        return
+
+    plan, report = [], []                        # plan: (keeper rec, [(loser rec, reason)])
+    for group in find_duplicate_groups(recs, cfg["dd_fingerprint"] and not report_only):
+        covers = {r["p"]: _dd_has_cover(mutagen_file, Path(r["p"])) for r in group}
+        ranked = sorted(group, key=lambda r: _dd_rank(r, covers[r["p"]], music_dir), reverse=True)
+        best = ranked[0]
+        bkey = _dd_rank(best, covers[best["p"]], music_dir)
+        plan.append((best, [(r, _dd_reason(bkey, _dd_rank(r, covers[r["p"]], music_dir), music_dir))
+                            for r in ranked[1:]]))
+    plan.sort(key=lambda g: g[0]["name"].lower())
+    moving = sum(len(g[1]) for g in plan)
+    new_files, empty_dirs = _dd_walk(music_dir) if cfg["dd_cleanup"] else ([], [])
+    junk = broken + new_files if cfg["dd_cleanup"] else []
+
+    print(f"--- duplicates: {len(plan)} songs have extra copies ({moving} files) ---")
+    for keeper, losers in plan:
+        report.append(f"KEEP  {keeper['p']}  ({keeper['kbps']} kbps)")
+        for r, why in losers:
+            report.append(f"MOVE  {r['p']}  ({r['kbps']} kbps)  because: {why}")
+        report.append("")
+    def short(r):
+        p = Path(r["p"])
+        return f"{p.parent.name}/{p.name}"
+    for keeper, losers in plan[:25]:
+        print(f"  KEEP {short(keeper)}  ({keeper['kbps']} kbps)")
+        for r, why in losers:
+            print(f"    MOVE {short(r)}  ({r['kbps']} kbps, {why})")
+    if len(plan) > 25:
+        print(f"  ... and {len(plan) - 25} more. The full list is in the report.")
+    if cfg["dd_cleanup"]:
+        print(f"--- cleanup: {len(junk)} empty, unreadable or leftover files, {len(empty_dirs)} empty folders ---")
+        for f in junk[:10]:
+            print("  ", f)
+        report += ["BROKEN/LEFTOVER " + str(f) for f in junk] + ["EMPTY FOLDER " + str(d) for d in empty_dirs]
+    (state / "dedupe-report.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
+    print(f"Full list: {state / 'dedupe-report.txt'}")
+
+    if dry_run:
+        if moving or junk or empty_dirs:
+            print("Preview only, nothing was moved. To move the extra copies into "
+                  f"{DUP_DIR}/ (nothing is deleted), run:  python3 dl.py --dedupe")
+        else:
+            print("Nothing to clean up.")
+        _dd_save_cache(cache_file, cache)
+        return
+
+    moved = merged = 0
+    for keeper, losers in plan:
+        if cfg["dd_merge"]:
+            merged += _dd_merge_tags(mutagen_file, Path(keeper["p"]), [Path(r["p"]) for r, _ in losers])
+        for r, _ in losers:
+            try:
+                _dd_move(Path(r["p"]), music_dir)
+                cache.pop(r["p"], None)
+                moved += 1
+            except OSError as e:
+                print(f"  Could not move {r['p']}: {e}")
+    for f in junk:
+        try:
+            _dd_move(f, music_dir, BROKEN_DIR)
+            cache.pop(str(f), None)
+        except (OSError, ValueError) as e:
+            print(f"  Could not move {f}: {e}")
+    if cfg["dd_cleanup"]:                        # the moves above may have emptied folders
+        empty_dirs = _dd_walk(music_dir)[1]
+    for d in empty_dirs:
+        while len(d.relative_to(music_dir).parts) >= 2:   # a folder that held only an empty folder
+            try:
+                d.rmdir()
+            except OSError:
+                break
+            d = d.parent
+    _dd_save_cache(cache_file, cache)
+    print(f"Moved {moved} duplicate files and {len(junk)} broken/leftover files to {music_dir / DUP_DIR}. "
+          f"Filled {merged} missing tags on kept copies. Delete {DUP_DIR} when you are happy.")
+
+
+def _dd_save_cache(path, cache):
+    try:
+        part = path.with_name(path.name + ".part")
+        part.write_text(json.dumps({"v": 2, "files": {k: v for k, v in cache.items() if os.path.exists(k)}}),
+                        encoding="utf-8")
+        os.replace(part, path)
+    except OSError:
+        pass
+
+
 def run_inner(py, *args):
     """Run this file again with the private venv's Python (it has mutagen)."""
     rc = subprocess.run([str(py), str(Path(__file__).resolve()), *args], env=CHILD_ENV).returncode
@@ -1441,20 +1983,32 @@ def main():
         say("Sorting songs into genre folders...")
         run_sorter(py)
 
+    if cfg["dd_preview"]:
+        say("Checking for duplicate songs (preview only, nothing is moved)...")
+        run_inner(py, "--dedupe-inner", "--dry-run")
+
 
 if __name__ == "__main__":
     args = sys.argv[1:]
     try:
-        known = {"-h", "--help", "--sort", "--dry-run", "--upgrade", "--sort-inner",
-                 "--seed-inner", "--upgrade-inner"}
+        known = {"-h", "--help", "--sort", "--dry-run", "--upgrade", "--dedupe", "--report",
+                 "--sort-inner", "--seed-inner", "--upgrade-inner", "--dedupe-inner", "--report-only"}
         if "-h" in args or "--help" in args:
             print(__doc__)
-        elif set(args) - known or ("--dry-run" in args and not {"--sort", "--sort-inner"} & set(args)):
-            sys.exit("Usage: dl.py [--sort [--dry-run]] [--upgrade] [--help]\n"
+        elif set(args) - known or ("--dry-run" in args and not {"--sort", "--sort-inner", "--dedupe", "--dedupe-inner"} & set(args)):
+            sys.exit("Usage: dl.py [--sort | --dedupe [--dry-run]] [--report] [--upgrade] [--help]\n"
                      "(unknown option, or --dry-run used without --sort)")
         elif "--sort-inner" in args:            # runs inside the private venv (has mutagen)
             _cfg = load_config()
             sort_library(_cfg["music_dir"], _cfg["overrides_file"], "--dry-run" in args)
+        elif "--dedupe-inner" in args:          # runs inside the private venv (has mutagen)
+            run_dedupe(load_config(), "--dry-run" in args, "--report-only" in args)
+        elif "--dedupe" in args or "--report" in args:
+            create_missing_files(need_playlists=False)
+            _cfg = load_config()
+            run_inner(ensure_spotdl(_cfg["venv_dir"]), "--dedupe-inner",
+                      *(["--dry-run"] if "--dry-run" in args else []),
+                      *(["--report-only"] if "--report" in args else []))
         elif "--upgrade-inner" in args:         # runs inside the private venv (has mutagen)
             _cfg = load_config()
             upgrade_from_soundcloud(_cfg["music_dir"], _cfg["state_dir"])
