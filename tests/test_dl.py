@@ -204,7 +204,7 @@ class EgoArt(unittest.TestCase):
     def test_cassette_is_3d(self):
         rows = dl.cassette_parts("S O N G S", "3,185", "186 hours")
         parts = {part for row in rows for _, part in row}
-        self.assertEqual(parts, {"front", "top", "side", "shadow"})
+        self.assertEqual(parts, {"front", "top", "side"})
         plain = dl.cassette("S O N G S", "3,185", "186 hours")
         self.assertEqual(len({len(r) for r in plain}), 1)
         text = "\n".join(plain)
@@ -218,8 +218,8 @@ class EgoArt(unittest.TestCase):
                 self.assertIn(key, pal)
         old, dl.COLOR_ON = dl.COLOR_ON, True
         try:
-            text = "\n".join(dl.ego_pretty(self.stats(), unicode_ok=True)[:20])
-            for key in ("blue", "blue_hi", "blue_lo", "blue_sh"):
+            text = "\n".join(dl.ego_pretty(self.stats(), unicode_ok=True)[:16])
+            for key in ("blue", "blue_hi", "blue_lo"):
                 self.assertIn("\033[" + dl.PALETTE[key] + "m", text)
             self.assertNotIn("\033[" + dl.PALETTE["ok"] + "m", text)        # no magenta in the cassette
         finally:
@@ -231,6 +231,7 @@ class EgoArt(unittest.TestCase):
         self.assertTrue(all(ord(c) < 128 for c in text))
         self.assertIn("150 songs", text)
         self.assertIn("Genres", text)
+        self.assertNotIn("Y O U R", text)                     # the title strip is gone
 
     def test_pretty_unicode_has_bars(self):
         dl.COLOR_ON = False

@@ -3338,8 +3338,8 @@ def _cassette_front(top, mid, low):
 
 
 def cassette_parts(top, mid, low, depth=2):
-    """The cassette as a 3D box (oblique view): front face, a lit top face, a shaded side face and a floor
-    shadow. Returns rows; a row is a list of (text, part) with part front, top, side or shadow. Same width."""
+    """The cassette as a 3D box (oblique view): front face, a lit top face and a shaded side face.
+    Returns rows; a row is a list of (text, part) with part front, top or side. All rows have the same width."""
     front = _cassette_front(top, mid, low)
     w, hf, d = len(front[0]), len(front), depth
     total = w + 2 * d
@@ -3362,21 +3362,12 @@ def cassette_parts(top, mid, low, depth=2):
         used = sum(len(t) for t, _ in segs)
         segs.append((" " * (total - used), "side"))
         rows.append(segs)
-    rows.append([(" " * 3 + "." * (total - 6) + " " * 3, "shadow")])
     return rows
 
 
 def cassette(top, mid, low):
     "The 3D cassette as plain text rows, all the same width."
     return ["".join(t for t, _ in row) for row in cassette_parts(top, mid, low)]
-
-
-def equalizer(width=52, unicode_ok=True):
-    "A row of bars like a graphic equalizer (deterministic)."
-    if not unicode_ok:
-        return "|".join("" for _ in range(1)) + "".join("|!:."[(int(2 + 1.9 * math.sin(i * 0.7)) % 4)] for i in range(width))
-    blocks = "▁▂▃▄▅▆▇█"
-    return "".join(blocks[int((math.sin(i * 0.7) + math.sin(i * 0.31 + 1) + 2) / 4 * 7.99)] for i in range(width))
 
 
 def _bar(frac, width, unicode_ok):
@@ -3386,18 +3377,15 @@ def _bar(frac, width, unicode_ok):
 
 
 def ego_pretty(st, unicode_ok=True):
-    "The portrait decorated for a terminal: cassette art, equalizer, bars. Returns a list of lines."
+    "The portrait decorated for a terminal: cassette art and bars. Returns a list of lines."
     import textwrap
     lines = [""]
     if st["songs"]:
         hours = f"{st['hours']:.0f} hours"
-        tint = {"front": "blue", "top": "blue_hi", "side": "blue_lo", "shadow": "blue_sh"}
+        tint = {"front": "blue", "top": "blue_hi", "side": "blue_lo"}
         for row in cassette_parts("S O N G S", f"{st['songs']:,}", hours):
             lines.append("   " + "".join(paint(t, tint[part]) if t.strip() else t for t, part in row))
-        lines.append(paint("   " + " " * 2 + equalizer(52, unicode_ok), "blue_hi"))
-    note = "♪" if unicode_ok else "~"
-    lines += ["", paint(f"   {note}  Y O U R   L I B R A R Y ,   I N   W O R D S  {note}", "bold"),
-              paint("   " + ("─" if unicode_ok else "-") * 52, "dim"), ""]
+    lines.append("")
     dot = " · " if unicode_ok else " | "
     for item in ego_items(st):
         label = paint(f"{item['label']:<11}", "warn" if item.get("kind") == "warn" else "bold")
