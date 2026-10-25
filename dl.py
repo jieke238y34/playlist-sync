@@ -23,7 +23,14 @@ COMMANDS
     python3 dl.py                   download, then sort into genre folders
     python3 dl.py --sort            sort only
     python3 dl.py --sort --dry-run  preview the sort, move nothing
+    python3 dl.py --upgrade         SoundCloud upgrade only (songs still waiting from earlier runs)
     python3 dl.py --help            show this text
+
+SOURCES
+    YouTube is tried first. Songs that came from YouTube are then tried on SoundCloud. A SoundCloud
+    file replaces the YouTube file only if it is not DRM protected, is about as long, is at least
+    60 s and is not a cover, remix or live version. Switch it off in config.ini
+    ([sources] prefer_soundcloud = no).
 
 SPEED
     To avoid YouTube blocks, yt-dlp waits 15 to 40 seconds between tracks. Large
@@ -165,6 +172,13 @@ try:
     from spotdl.utils.formatter import create_song_title as _title
     _seen = {}
     _cache = {}
+    _NOFB = bool(__import__("os").environ.get("DL_NO_FALLBACK"))   # the SoundCloud upgrade run
+    def _mark(song, url):
+        "One line per finished download. dl.py reads it: Spotify link, download link, name."
+        try:
+            print("DL-OK " + song.url + " " + url + " " + song.display_name, flush=True)
+        except Exception:
+            pass
     _o_results = _YT.get_results
     def _results(self, term, *a, **k):
         if term not in _cache:                       # one YouTube search per song
@@ -300,6 +314,8 @@ try:
         try:
             url = _clean(song, _o_search(self, song))
         except LookupError:
+            if _NOFB:
+                raise
             url, how = _find(self, song)
             if not url:
                 raise
@@ -315,11 +331,14 @@ try:
         return (t[0] if t else repr(c))[:200]
     def _get(self, url, download=False):
         try:
-            return _o_get(self, url, download)
+            out = _o_get(self, url, download)
+            if download and url in _seen:
+                _mark(_seen[url][1], url)
+            return out
         except _AErr as e:
             if download:                             # spotDL hides this. dl.py needs it to see blocks.
                 print("  Reason: " + _why(e), flush=True)
-            if not (download and "soundcloud.com" in url and url in _seen):
+            if _NOFB or not (download and "soundcloud.com" in url and url in _seen):
                 raise
             dl, song = _seen[url]
             new, how = _find(dl, song)
@@ -330,7 +349,9 @@ try:
             print("SoundCloud failed for " + song.display_name + ". Using " + how + ".", flush=True)
             song.download_url = new                  # the log line and the tags show the real source
             try:
-                return _o_get(self, new, download)
+                out = _o_get(self, new, download)
+                _mark(song, new)
+                return out
             except _AErr as e2:
                 print("  Reason: " + _why(e2), flush=True)
                 raise
@@ -420,10 +441,16 @@ max_failed_in_row = 3
 [sources]
 # Where to look for each song, in order. The first source that has the song wins.
 # Words: soundcloud, youtube, youtube-music. Separate them with spaces.
-# Default: soundcloud youtube
-# Note: SoundCloud audio can be lower quality, and some songs there are only
-# 30 second previews. Put youtube first if you care more about quality.
-audio_sources = soundcloud youtube
+# Default: youtube soundcloud
+audio_sources = youtube soundcloud
+
+# yes = songs that came from YouTube are tried on SoundCloud afterwards. If SoundCloud
+# has a good match (no DRM, about the same length, not a cover or remix), it replaces
+# the YouTube file. The check is strict because SoundCloud also has remixes, covers and
+# 30 second previews. Needs soundcloud in audio_sources. Default: yes
+# The replacement is a fresh download: its tags are written again by spotDL.
+# no = keep the YouTube file. SoundCloud is then only used when YouTube has no match.
+prefer_soundcloud = yes
 
 [updates]
 # yes = update spotDL and yt-dlp once a day (recommended: YouTube changes often,
@@ -544,7 +571,8 @@ def load_config():
         "max_bad": number("max_failed_in_row", 3),
         "overrides_file": path("genre_overrides_file", HERE / "genre_overrides.txt"),
         "sort_after": yes_no("sort_after_download", True),
-        "audio": sources("audio_sources", ["soundcloud", "youtube"]),
+        "audio": sources("audio_sources", ["youtube", "soundcloud"]),
+        "prefer_sc": yes_no("prefer_soundcloud", True, "sources"),
         "auto_update": yes_no("auto_update", True, "updates"),
     }
 
@@ -674,14 +702,17 @@ def ensure_ffmpeg(py):
     return ff
 
 
-def yt_args(js, cookies):
+def yt_args(js, cookies, slow=True):
     """Build the yt-dlp argument string that spotDL passes on."""
     parts = list(js)
     if cookies:
         # Forward slashes and double quotes survive spotDL's argument splitting on Windows.
         p = f'"{cookies.as_posix()}"' if IS_WIN else shlex.quote(str(cookies))
         parts += ["--cookies", p]
-    parts += ["--sleep-interval", "15", "--max-sleep-interval", "40", "--sleep-requests", "2"]
+    if slow:                                     # YouTube blocks fast clients
+        parts += ["--sleep-interval", "15", "--max-sleep-interval", "40", "--sleep-requests", "2"]
+    else:                                        # SoundCloud needs far less
+        parts += ["--sleep-interval", "1", "--max-sleep-interval", "3"]
     return " ".join(parts)
 
 
@@ -701,8 +732,9 @@ def test_download(py, js, ffmpeg, cookies=None):
     return False, (lines[-1][:150] if lines else f"exit code {r.returncode}"), bool(BLOCK_RE.search(r.stderr))
 
 
-def run_playlist(cmd, cwd, log, max_block):
+def run_playlist(cmd, cwd, log, max_block, marks=None):
     """Run spotDL. Copy output to screen and log. Stop it if too many block errors.
+    marks: if given, gets the DL-OK lines of finished downloads (not shown, not logged).
     Returns (exit code, stopped by us, block-error lines)."""
     block_lines, hit = [], False
     p = subprocess.Popen(cmd, cwd=cwd, env=CHILD_ENV, stdout=subprocess.PIPE,
@@ -710,6 +742,10 @@ def run_playlist(cmd, cwd, log, max_block):
                          encoding="utf-8", errors="replace")
     try:
         for line in p.stdout:
+            if line.startswith("DL-OK "):
+                if marks is not None:
+                    marks.append(line.rstrip("\r\n")[6:])
+                continue
             sys.stdout.write(line)
             log.write(line)
             log.flush()
@@ -1030,6 +1066,142 @@ def seed_archive(music_dir, archive_file):
               f"during the download.")
 
 
+# ---------------------------------------------------------------------
+# SOUNDCLOUD UPGRADE
+# Songs that came from YouTube are tried on SoundCloud afterwards. A SoundCloud file
+# replaces the YouTube file only if it passes the checks below. Anything else stays.
+UPGRADE_FILE = "soundcloud-upgrade.txt"       # in state_dir: Spotify links still to try
+UPGRADE_BATCH = 100
+UPGRADE_BAD = ("cover", "karaoke", "instrumental", "reaction", "live", "8d", "slowed",
+               "sped up", "nightcore", "remix", "edit", "bootleg", "mashup", "tutorial", "lesson")
+
+
+def queue_upgrades(state, marks):
+    "Remember the songs that came from YouTube (not SoundCloud) in this playlist run."
+    urls = []
+    for m in marks:
+        parts = m.split(" ", 2)
+        if (len(parts) >= 2 and parts[0].startswith("https://open.spotify.com/track/")
+                and "soundcloud.com" not in parts[1]):
+            urls.append(parts[0])
+    if urls:
+        with (state / UPGRADE_FILE).open("a", encoding="utf-8") as f:
+            f.write("".join(u + "\n" for u in urls))
+
+
+def _bad_version(link, name):
+    "True if the SoundCloud link names a cover, remix, live... that the Spotify title does not."
+    slug = link.split("soundcloud.com/", 1)[-1].split("/", 1)[-1].lower()   # skip the uploader
+    slug = re.sub(r"[^a-z0-9]+", " ", slug)
+    name = re.sub(r"[^a-z0-9]+", " ", name.lower())
+    return any(re.search(rf"\b{w}\b", slug) and not re.search(rf"\b{w}\b", name)
+               for w in UPGRADE_BAD)
+
+
+def _length(mutagen_file, path):
+    return float(mutagen_file(path).info.length)
+
+
+def _upgrade_ok(mutagen_file, new, old, link, name):
+    "(True, '') if the SoundCloud file new may replace the YouTube file old. Else (False, reason)."
+    try:
+        n, o = _length(mutagen_file, new), _length(mutagen_file, old)
+    except Exception as e:
+        return False, f"could not read the length ({e!r:.60})"
+    if new.suffix.lower() != old.suffix.lower():
+        return False, "different file type"
+    if n < 60:
+        return False, f"only {n:.0f} s long (a preview?)"
+    if abs(n - o) > max(10, o * 0.08):
+        return False, f"length differs ({n:.0f} s on SoundCloud, {o:.0f} s on YouTube)"
+    if _bad_version(link, name):
+        return False, "the SoundCloud link looks like a cover, remix or live version"
+    return True, ""
+
+
+def upgrade_from_soundcloud(music_dir, state_dir):
+    "Runs inside the private venv (it has mutagen)."
+    pending = state_dir / UPGRADE_FILE
+    if not pending.is_file():
+        return
+    try:
+        from mutagen import File as mutagen_file
+    except ImportError:
+        return
+    urls = list(dict.fromkeys(x.strip() for x in
+                              pending.read_text(encoding="utf-8", errors="replace").splitlines()
+                              if x.strip()))
+    wanted = set(urls)
+    index = {}                                   # Spotify link -> the file in the library
+    tmp = state_dir / "upgrade-tmp"
+    shutil.rmtree(tmp, ignore_errors=True)       # left over from a stopped run
+    for f in audio_files(music_dir):
+        u = _spotify_url(mutagen_file, f)
+        if u in wanted:
+            index.setdefault(u, f)
+            if len(index) == len(wanted):        # every song found: stop reading tags
+                break
+    todo = [u for u in urls if u in index]
+    print(f"SoundCloud upgrade: {len(todo)} songs to try "
+          f"({len(urls) - len(todo)} are no longer in the library).")
+    js = ["--js-runtimes", "node"] if shutil.which("node") else []
+    CHILD_ENV["DL_NO_FALLBACK"] = "1"            # SoundCloud only: no quiet switch back to YouTube
+    log = open(state_dir / "dl.log", "a", encoding="utf-8")
+    try:
+        replaced = _upgrade_batches(todo, index, tmp, js, log, pending, mutagen_file)
+    finally:
+        log.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"SoundCloud upgrade finished: {replaced} of {len(todo)} songs replaced.")
+
+
+def _upgrade_batches(todo, index, tmp, js, log, pending, mutagen_file):
+    replaced = 0
+    for i in range(0, len(todo), UPGRADE_BATCH):
+        batch = todo[i:i + UPGRADE_BATCH]
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        marks = []
+        cmd = [sys.executable, "-c", SPOTDL_RUNNER, "download", *batch,
+               "--threads", "1", "--max-retries", "3", "--audio", "soundcloud",
+               "--format", "mp3", "--bitrate", "192k",
+               "--output", "{title} - {artist} - {album}.{output-ext}",
+               "--yt-dlp-args", yt_args(js, None, slow=False)]
+        rc, _, _ = run_playlist(cmd, tmp, log, 10 ** 9, marks)
+        if rc != 0:                              # spotDL crashed: keep this batch for next time
+            print(f"WARNING: spotDL stopped (exit code {rc}). The rest stays queued. "
+                  "Run  dl.py --upgrade  to try again.")
+            break
+        got = {}                                 # Spotify link -> (SoundCloud link, name)
+        for m in marks:
+            parts = m.split(" ", 2)
+            if len(parts) == 3:
+                got[parts[0]] = (parts[1], parts[2])
+        for f in audio_files(tmp):
+            u = _spotify_url(mutagen_file, f)
+            if u not in got or u not in index:
+                continue
+            link, name = got[u]
+            ok, why = _upgrade_ok(mutagen_file, f, index[u], link, name)
+            if ok:
+                stage = index[u].with_name(index[u].name + ".new")
+                try:
+                    shutil.move(str(f), str(stage))   # same folder first, so the swap is one step
+                    os.replace(stage, index[u])
+                    replaced += 1
+                    print(f"  Upgraded to SoundCloud: {name}")
+                except OSError as e:                  # file in use, disk full...: keep the old one
+                    stage.unlink(missing_ok=True)
+                    print(f"  Kept the YouTube version of {name}: could not replace it ({e})")
+            else:
+                print(f"  Kept the YouTube version of {name}: {why}")
+        rest = todo[i + UPGRADE_BATCH:]          # progress survives a stop
+        pending.write_text("".join(u + "\n" for u in rest), encoding="utf-8")
+    else:
+        pending.unlink(missing_ok=True)          # every batch ran
+    return replaced
+
+
 def run_inner(py, *args):
     """Run this file again with the private venv's Python (it has mutagen)."""
     rc = subprocess.run([str(py), str(Path(__file__).resolve()), *args], env=CHILD_ENV).returncode
@@ -1180,12 +1352,14 @@ def main():
     # (short wait: YouTube has not been asked for them yet). The other passes then wait.
     sources = list(cfg["audio"])
     fallback = [x for x in sources if x != "soundcloud"] or ["youtube"]
-    if "soundcloud" in sources:
+    if sources[0] == "soundcloud":
         plan = [(sources, 0, False), (fallback, cfg["pause"], False),
                 (fallback, cfg["pass_wait"], True), (fallback, cfg["pass_wait"], True)]
     else:
         plan = [(sources, 0, False), (sources, cfg["pass_wait"], True),
                 (sources, cfg["pass_wait"], True)]
+    # With soundcloud first, a song on YouTube already failed on SoundCloud: no point asking again.
+    upgrade_on = cfg["prefer_sc"] and "soundcloud" in sources and sources[0] != "soundcloud"
     bad = 0
     for pas, (audio, wait, use_cookies) in enumerate(plan, 1):
         pass_cookies = None
@@ -1224,7 +1398,10 @@ def main():
                    "--format", "mp3", "--bitrate", "192k", *sponsor,
                    "--output", "{title} - {artist} - {album}.{output-ext}",
                    "--yt-dlp-args", yt]
-            rc, hit, block_lines = run_playlist(cmd, music, log, cfg["max_block"])
+            marks = []
+            rc, hit, block_lines = run_playlist(cmd, music, log, cfg["max_block"], marks)
+            if upgrade_on:
+                queue_upgrades(state, marks)
 
             with err.open("a", encoding="utf-8") as f:
                 if hit:
@@ -1256,6 +1433,10 @@ def main():
         say("No failed songs.")
     notify(f"All passes finished. Failed tracks are in {state}")
 
+    if upgrade_on:
+        say("Trying SoundCloud for songs that came from YouTube...")
+        run_inner(py, "--upgrade-inner")
+
     if cfg["sort_after"]:
         say("Sorting songs into genre folders...")
         run_sorter(py)
@@ -1264,15 +1445,23 @@ def main():
 if __name__ == "__main__":
     args = sys.argv[1:]
     try:
-        known = {"-h", "--help", "--sort", "--dry-run", "--sort-inner", "--seed-inner"}
+        known = {"-h", "--help", "--sort", "--dry-run", "--upgrade", "--sort-inner",
+                 "--seed-inner", "--upgrade-inner"}
         if "-h" in args or "--help" in args:
             print(__doc__)
         elif set(args) - known or ("--dry-run" in args and not {"--sort", "--sort-inner"} & set(args)):
-            sys.exit("Usage: dl.py [--sort [--dry-run]] [--help]\n"
-                     "(--dry-run only works together with --sort)")
+            sys.exit("Usage: dl.py [--sort [--dry-run]] [--upgrade] [--help]\n"
+                     "(unknown option, or --dry-run used without --sort)")
         elif "--sort-inner" in args:            # runs inside the private venv (has mutagen)
             _cfg = load_config()
             sort_library(_cfg["music_dir"], _cfg["overrides_file"], "--dry-run" in args)
+        elif "--upgrade-inner" in args:         # runs inside the private venv (has mutagen)
+            _cfg = load_config()
+            upgrade_from_soundcloud(_cfg["music_dir"], _cfg["state_dir"])
+        elif "--upgrade" in args:               # SoundCloud upgrade only, no download
+            create_missing_files(need_playlists=False)
+            _cfg = load_config()
+            run_inner(ensure_spotdl(_cfg["venv_dir"]), "--upgrade-inner")
         elif "--seed-inner" in args:            # runs inside the private venv (has mutagen)
             _cfg = load_config()
             seed_archive(_cfg["music_dir"], _cfg["archive_file"])

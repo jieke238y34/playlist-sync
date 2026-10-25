@@ -19,6 +19,11 @@ spotDL and yt-dlp into a private folder and downloads ffmpeg if the system has n
 - `config.ini`: folders, timing and optional YouTube cookies.
 - `genre_overrides.txt`: optional `Artist=Folder` rules that beat the automatic genre.
 
+Sources: YouTube first. Songs that came from YouTube are then tried on SoundCloud, and a
+SoundCloud file replaces the YouTube one only if it passes strict checks (no DRM, at least
+60 s, about the same length, not a cover or remix). Turn it off with `prefer_soundcloud = no`
+in `config.ini`. `python3 dl.py --upgrade` runs just that step for songs still waiting.
+
 Optional: node (fewer YouTube errors) and a cookies file (age-restricted songs).
 
 These three files are personal and listed in `.gitignore`.
