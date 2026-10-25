@@ -3301,8 +3301,8 @@ def ego_text(st):
     return [i["text"] for i in ego_items(st)]
 
 
-def cassette(top, mid, low):
-    "A cassette tape in ASCII (screws, spoked reels, label stripe, tape heads), every row 53 wide."
+def _cassette_front(top, mid, low):
+    "The front of a cassette in ASCII (screws, spoked reels, label stripe, tape heads), every row 53 wide."
     w = 50
 
     def body(inner):                      # one row of the outer shell
@@ -3329,6 +3329,40 @@ def cassette(top, mid, low):
     return rows
 
 
+def cassette_parts(top, mid, low, depth=3):
+    """The cassette as a 3D box (oblique view): front face, a lit top face, a shaded side face and a floor
+    shadow. Returns rows; a row is a list of (text, part) with part front, top, side or shadow. Same width."""
+    front = _cassette_front(top, mid, low)
+    w, hf, d = len(front[0]), len(front), depth
+    total = w + 2 * d
+    rows = []
+    for g in range(hf + d):
+        segs = []
+        if g == 0:                                              # back edge of the top face
+            segs.append((" " * (2 * d) + "." + "-" * (w - 2) + ".", "top"))
+        elif g < d:                                             # top face
+            segs.append((" " * (2 * (d - g)) + "/" + ":" * (w - 2) + "/", "top"))
+            segs.append(("#" * (2 * g - 1) + "|", "side"))
+        else:
+            segs.append((front[g - d], "front"))
+            if g <= hf - 1:                                     # side face, full width
+                segs.append(("#" * (2 * d - 1) + "|", "side"))
+            else:                                               # side face tapers at the bottom
+                n = 2 * d - 2 * (g - hf + 1)
+                if n > 0:
+                    segs.append(("#" * (n - 1) + "/", "side"))
+        used = sum(len(t) for t, _ in segs)
+        segs.append((" " * (total - used), "side"))
+        rows.append(segs)
+    rows.append([(" " * 3 + "." * (total - 6) + " " * 3, "shadow")])
+    return rows
+
+
+def cassette(top, mid, low):
+    "The 3D cassette as plain text rows, all the same width."
+    return ["".join(t for t, _ in row) for row in cassette_parts(top, mid, low)]
+
+
 def equalizer(width=52, unicode_ok=True):
     "A row of bars like a graphic equalizer (deterministic)."
     if not unicode_ok:
@@ -3349,8 +3383,10 @@ def ego_pretty(st, unicode_ok=True):
     lines = [""]
     if st["songs"]:
         hours = f"{st['hours']:.0f} hours"
-        lines += [paint("   " + l, "ok") for l in cassette("S O N G S", f"{st['songs']:,}", hours)]
-        lines.append(paint("   " + equalizer(52, unicode_ok), "err"))
+        tint = {"front": "ok", "top": "bold", "side": "dim", "shadow": "dim"}
+        for row in cassette_parts("S O N G S", f"{st['songs']:,}", hours):
+            lines.append("   " + "".join(paint(t, tint[part]) if t.strip() else t for t, part in row))
+        lines.append(paint("   " + " " * 2 + equalizer(52, unicode_ok), "err"))
     note = "♪" if unicode_ok else "~"
     lines += ["", paint(f"   {note}  Y O U R   L I B R A R Y ,   I N   W O R D S  {note}", "bold"),
               paint("   " + ("─" if unicode_ok else "-") * 52, "dim"), ""]

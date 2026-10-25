@@ -201,6 +201,17 @@ class EgoArt(unittest.TestCase):
         self.assertEqual(len({len(r) for r in rows}), 1)
         self.assertTrue(all(ord(c) < 128 for r in rows for c in r))     # the art is plain ASCII
 
+    def test_cassette_is_3d(self):
+        rows = dl.cassette_parts("S O N G S", "3,185", "186 hours")
+        parts = {part for row in rows for _, part in row}
+        self.assertEqual(parts, {"front", "top", "side", "shadow"})
+        plain = dl.cassette("S O N G S", "3,185", "186 hours")
+        self.assertEqual(len({len(r) for r in plain}), 1)
+        text = "\n".join(plain)
+        self.assertIn("3,185", text)
+        self.assertIn("186 hours", text)
+        self.assertIn("#", text)                                      # the shaded side
+
     def test_pretty_ascii_fallback(self):
         dl.COLOR_ON = False
         text = "\n".join(dl.ego_pretty(self.stats(), unicode_ok=False))
