@@ -72,7 +72,7 @@ import traceback
 import urllib.request
 import venv
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # spotDL needs Python 3.10 to 3.14 (checked on PyPI, 2026-10). Change MAX_PY if spotDL adds support.
@@ -381,7 +381,7 @@ def paint(text, kind):
 
 _OK_START = ("Downloaded ", "Upgraded", "SoundCloud upgrade finished", "Moved ", "All passes finished",
              "Created ", "No failed songs", "Nothing to clean up")
-_DIM_START = ("Skipped", "Skipping", "Found ", "Processing query", "Waiting ", "Saved ", "Checking ",
+_DIM_START = ("ETA", "Skipped", "Skipping", "Found ", "Processing query", "Waiting ", "Saved ", "Checking ",
               "Library check", "Nothing was moved")
 _WARN_START = ("SoundCloud failed", "No close match", "Kept the YouTube", "NOTE", "Note:", "Fallback")
 
@@ -585,6 +585,7 @@ try:
                 print("Skipped " + str(skip) + " songs that are already in your music folders "
                       "(same title and artist).", flush=True)
             songs = keep
+            print("DL-PLAN " + str(sum(1 for s in keep if s.url not in self.url_archive)), flush=True)
         except Exception as e:                       # never break the download
             print("Note: the library name check is off (" + repr(e)[:150] + ").", flush=True)
         return _o_dms(self, songs)
@@ -1082,9 +1083,75 @@ def test_download(py, js, ffmpeg, cookies=None):
     return False, (lines[-1][:150] if lines else f"exit code {r.returncode}"), bool(BLOCK_RE.search(r.stderr))
 
 
-def run_playlist(cmd, cwd, log, max_block, marks=None):
+def _fmt_secs(sec):
+    m = int(sec) // 60
+    h, m = divmod(m, 60)
+    return f"{h} h {m} min" if h else (f"{m} min" if m else "under 1 min")
+
+
+class Eta:
+    """Rough time left in a pass. Learns the seconds per song during the run and the playlist
+    sizes from earlier runs (playlist-sizes.json in the state folder)."""
+
+    def __init__(self, state_dir, pause):
+        self.file, self.pause, self.rates = state_dir / "playlist-sizes.json", pause, []
+        try:
+            self.sizes = json.loads(self.file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.sizes = {}
+
+    def begin_pass(self, todo):
+        self.todo, self.found_sum, self.new_sum = list(todo), 0, 0
+
+    def begin_playlist(self, n, pid):
+        self.pos, self.pid, self.found, self.new, self.done = n, pid, None, None, 0
+        self.t_last = time.time()
+
+    def end_playlist(self):
+        self.found_sum += self.found or 0
+        self.new_sum += self.new if self.new is not None else (self.found or 0)
+
+    def line(self, raw):
+        "Called with every spotDL output line. Returns an ETA line to show, or None."
+        t = raw.strip()
+        m = re.match(r"Found (\d+) songs", t)
+        if m:
+            self.found = int(m.group(1))
+            self.sizes[self.pid] = self.found
+            try:
+                self.file.write_text(json.dumps(self.sizes), encoding="utf-8")
+            except OSError:
+                pass
+        elif t.startswith("DL-PLAN "):
+            self.new = int(t.split()[1])
+            self.t_last = time.time()
+            return self.text()
+        elif t.startswith("DL-OK "):
+            now = time.time()
+            self.rates = (self.rates + [now - self.t_last])[-30:]
+            self.t_last, self.done = now, self.done + 1
+            return self.text()
+        return None
+
+    def text(self):
+        per = sum(self.rates) / len(self.rates) if self.rates else 30.0
+        cur_new = self.new if self.new is not None else (self.found or 0)
+        later = self.todo[self.pos:]
+        known = list(self.sizes.values())
+        avg = sum(known) / len(known) if known else 30
+        seen = self.found_sum + (self.found or 0)
+        ratio = (self.new_sum + cur_new) / seen if seen else 1.0   # how many songs are really new
+        songs = max(0, cur_new - self.done) + sum(self.sizes.get(p, avg) for p in later) * ratio
+        secs = songs * per + len(later) * self.pause
+        end = datetime.now() + timedelta(seconds=secs)
+        return (f"ETA about {_fmt_secs(secs)} left in this pass (done around {end:%H:%M}) | playlist "
+                f"{self.pos}/{len(self.todo)} | {self.done} of {cur_new} new songs | ~{per:.0f} s/song (rough)")
+
+
+def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
     """Run spotDL. Copy output to screen and log. Stop it if too many block errors.
     marks: if given, gets the DL-OK lines of finished downloads (not shown, not logged).
+    on_line: if given, called with every line. It may return an ETA line to show (screen only).
     Returns (exit code, stopped by us, block-error lines)."""
     block_lines, hit = [], False
     p = subprocess.Popen(cmd, cwd=cwd, env=CHILD_ENV, stdout=subprocess.PIPE,
@@ -1092,9 +1159,12 @@ def run_playlist(cmd, cwd, log, max_block, marks=None):
                          encoding="utf-8", errors="replace")
     try:
         for line in p.stdout:
-            if line.startswith("DL-OK "):
-                if marks is not None:
+            eta_line = on_line(line) if on_line else None
+            if line.startswith("DL-OK ") or line.startswith("DL-PLAN "):
+                if marks is not None and line.startswith("DL-OK "):
                     marks.append(line.rstrip("\r\n")[6:])
+                if eta_line:
+                    sys.stdout.write(colorize_line(eta_line) + "\n")
                 continue
             body = line.rstrip("\r\n")
             sys.stdout.write(colorize_line(body) + line[len(body):])
@@ -2238,6 +2308,7 @@ def main():
     # With soundcloud first, a song on YouTube already failed on SoundCloud: no point asking again.
     upgrade_on = cfg["prefer_sc"] and "soundcloud" in sources and sources[0] != "soundcloud"
     bad = 0
+    eta = Eta(state, cfg["pause"])
     for pas, (audio, wait, use_cookies) in enumerate(plan, 1):
         pass_cookies = None
         if pas == 1:
@@ -2258,6 +2329,7 @@ def main():
         # The YouTube test download runs at the start of a pass, and again only after a
         # playlist that had block-type errors or crashed. A clean playlist proves YouTube works.
         need_gate = True
+        eta.begin_pass(todo)
 
         for n, pid in enumerate(todo, 1):
             err = err_file(pid)
@@ -2276,7 +2348,9 @@ def main():
                    "--output", "{title} - {artist} - {album}.{output-ext}",
                    "--yt-dlp-args", yt]
             marks = []
-            rc, hit, block_lines = run_playlist(cmd, music, log, cfg["max_block"], marks)
+            eta.begin_playlist(n, pid)
+            rc, hit, block_lines = run_playlist(cmd, music, log, cfg["max_block"], marks, eta.line)
+            eta.end_playlist()
             if upgrade_on:
                 queue_upgrades(state, marks)
 

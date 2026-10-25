@@ -25,6 +25,7 @@ IDs starting `37i9dQZF`) do not work: copy their songs into your own public play
 |---|---|
 | Download | Each playlist is downloaded as 192 kbps MP3 with tags and cover art. Songs you already have are skipped, so it is safe to run again and again. |
 | Sources | YouTube first, then SoundCloud. Songs found on YouTube are tried on SoundCloud afterwards, and a SoundCloud file replaces the YouTube one only if it passes strict checks (see below). |
+| Progress | After each song a dim line shows a rough time left in the pass, when it should finish, and which playlist and song you are on. It learns the speed during the run and remembers playlist sizes between runs. |
 | Retries | Songs that failed are retried in later passes, with waits in between so YouTube does not block you. |
 | Sort | Songs are moved into genre folders (Pop, Rock, Hip-Hop, ...). Your own `Artist=Folder` rules win. |
 | Duplicates | A preview of duplicate songs is shown at the end. You decide whether to move them. |
