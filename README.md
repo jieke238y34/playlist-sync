@@ -53,16 +53,16 @@ IDs starting `37i9dQZF`) do not work: copy their songs into your own public play
 
 | Command | What it does |
 |---|---|
-| `python3 dl.py` | Download, upgrade from SoundCloud, sort, preview duplicates |
-| `python3 dl.py --sort` | Sort only. Add `--dry-run` to preview. |
-| `python3 dl.py --dedupe --dry-run` | Short summary, then type `--expand` to list the duplicates, `--dedupe` to move them, or `--exit` |
-| `python3 dl.py --dedupe` | Move duplicate songs to `_Duplicates/` straight away (nothing is deleted) |
-| `python3 dl.py --playlists` | Build the playlist files now. Add `--dry-run` to see what would be combined. |
-| `python3 dl.py --report` | Library report: songs, hours, size, formats, folders, weakest files |
-| `python3 dl.py --upgrade` | Run only the SoundCloud upgrade step for songs still waiting |
-| `python3 dl.py --colors [NAME]` | Show the colours in use, or preview a KDE colour scheme |
-| `python3 dl.py --themes` | List the KDE colour schemes you can use |
-| `python3 dl.py --help` | Show the built-in help |
+| `python dl.py` | Download, upgrade from SoundCloud, sort, preview duplicates |
+| `python dl.py --sort` | Sort only. Add `--dry-run` to preview. |
+| `python dl.py --dedupe --dry-run` | Short summary, then type `--expand` to list the duplicates, `--dedupe` to move them, or `--exit` |
+| `python dl.py --dedupe` | Move duplicate songs to `_Duplicates/` straight away (nothing is deleted) |
+| `python dl.py --playlists` | Build the playlist files now. Add `--dry-run` to see what would be combined. |
+| `python dl.py --report` | Library report: songs, hours, size, formats, folders, weakest files |
+| `python dl.py --upgrade` | Run only the SoundCloud upgrade step for songs still waiting |
+| `python dl.py --colors [NAME]` | Show the colours in use, or preview a KDE colour scheme |
+| `python dl.py --themes` | List the KDE colour schemes you can use |
+| `python dl.py --help` | Show the built-in help |
 
 ## Playlist files
 
@@ -73,7 +73,7 @@ every run. Songs that are not in your library yet are skipped and linked on a la
 
 Playlists with similar names are **combined**: "chill autumn vibes" and "cozy autumn vibes" become one
 `Autumn Vibes.m3u8`, and a song that is in both is listed once. Check what would be combined with
-`python3 dl.py --playlists --dry-run`.
+`python dl.py --playlists --dry-run`.
 
 It is automatic, and you can control it. Add a letter after a playlist ID in `playlists.txt`:
 

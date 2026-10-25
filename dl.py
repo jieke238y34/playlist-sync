@@ -5,7 +5,7 @@ ONE file. Works on Windows, Linux and macOS.
 
 RUN
     Windows:        double-click dl.py   (or: py dl.py)
-    Linux / macOS:  python3 dl.py
+    Linux / macOS:  python dl.py
 
 REQUIRED
     Python 3.10 to 3.14. Nothing else to install by hand.
@@ -20,19 +20,19 @@ FIRST RUN
     stops. Edit both files, then run it again.
 
 COMMANDS
-    python3 dl.py                   download, then sort into genre folders
-    python3 dl.py --sort            sort only
-    python3 dl.py --sort --dry-run  preview the sort, move nothing
-    python3 dl.py --dedupe          move duplicate songs to _Duplicates (nothing is deleted)
-    python3 dl.py --dedupe --dry-run  short summary, then type --expand (list the
+    python dl.py                   download, then sort into genre folders
+    python dl.py --sort            sort only
+    python dl.py --sort --dry-run  preview the sort, move nothing
+    python dl.py --dedupe          move duplicate songs to _Duplicates (nothing is deleted)
+    python dl.py --dedupe --dry-run  short summary, then type --expand (list the
                                     duplicates), --dedupe (move them) or --exit
-    python3 dl.py --playlists       build the playlist files (.m3u8). Add --dry-run to see what is combined.
-    python3 dl.py --report          library report (sizes, formats, weakest files)
-    python3 dl.py --colors          show the colours that are in use (KDE Plasma colours if available)
-    python3 dl.py --colors NAME     preview a KDE colour scheme that you have, active or not
-    python3 dl.py --themes          list the KDE colour schemes you can use as  theme = NAME
-    python3 dl.py --upgrade         SoundCloud upgrade only (songs still waiting from earlier runs)
-    python3 dl.py --help            show this text
+    python dl.py --playlists       build the playlist files (.m3u8). Add --dry-run to see what is combined.
+    python dl.py --report          library report (sizes, formats, weakest files)
+    python dl.py --colors          show the colours that are in use (KDE Plasma colours if available)
+    python dl.py --colors NAME     preview a KDE colour scheme that you have, active or not
+    python dl.py --themes          list the KDE colour schemes you can use as  theme = NAME
+    python dl.py --upgrade         SoundCloud upgrade only (songs still waiting from earlier runs)
+    python dl.py --help            show this text
 
 SOURCES
     YouTube is tried first. Songs that came from YouTube are then tried on SoundCloud. A SoundCloud
@@ -42,7 +42,7 @@ SOURCES
 
 DUPLICATES
     At the end of every run, dl.py previews duplicate songs (same artist, title and length,
-    or the same Spotify link) but moves nothing. To move them, run:  python3 dl.py --dedupe
+    or the same Spotify link) but moves nothing. To move them, run:  python dl.py --dedupe
     The best copy stays (lossless, higher bitrate, cover art, full tags). Live, remix and
     other versions are kept. Extra copies go to <music_dir>/_Duplicates. Also cleans empty
     or broken files and empty folders, fills a missing genre tag on the kept copy, and writes
@@ -866,7 +866,7 @@ PLAYLISTS_TEMPLATE = """\
 #       1r9DRLBzZqkPU0aDBVycY8 P=Road Trip      put it in the group "Road Trip"
 #   The letter can also touch the ID: 1r9DRLBzZqkPU0aDBVycY8X. A 22 character ID is always
 #   complete, so an ID that happens to end in P or X is safe.
-#   See what would be combined, without writing anything:  python3 dl.py --playlists --dry-run
+#   See what would be combined, without writing anything:  python dl.py --playlists --dry-run
 #
 # GOOD TO KNOW
 #   - Playlists download from top to bottom. Put the ones you want first at the top.
@@ -876,8 +876,8 @@ PLAYLISTS_TEMPLATE = """\
 #   - Each song is looked up on YouTube first, then SoundCloud. If SoundCloud has a good
 #     version it replaces the YouTube one. See [sources] in config.ini.
 #   - At the end of a run the script lists duplicate songs but moves nothing.
-#     Move them with:  python3 dl.py --dedupe    (see [dedupe] in config.ini)
-#   - Other commands:  --sort  --dedupe  --report  --upgrade  (python3 dl.py --help)
+#     Move them with:  python dl.py --dedupe    (see [dedupe] in config.ini)
+#   - Other commands:  --sort  --dedupe  --report  --upgrade  (python dl.py --help)
 #
 # >>>>>>>>>>>>>>>>  ADD YOUR PLAYLISTS BELOW THIS LINE  <<<<<<<<<<<<<<<<
 
@@ -2162,7 +2162,7 @@ def run_dedupe(cfg, dry_run=False, report_only=False, ask=False):
                 _dd_save_cache(cache_file, cache)
                 return
         else:
-            print("Nothing was moved. To see the list and choose:  python3 dl.py --dedupe --dry-run")
+            print("Nothing was moved. To see the list and choose:  python dl.py --dedupe --dry-run")
             _dd_save_cache(cache_file, cache)
             return
 
