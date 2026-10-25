@@ -26,6 +26,12 @@ COMMANDS
     python dl.py --dedupe          move duplicate songs to _Duplicates (nothing is deleted)
     python dl.py --dedupe --dry-run  short summary, then type --expand (list the
                                     duplicates), --dedupe (move them) or --exit
+    python dl.py --genres          fill in missing genres from MusicBrainz/Last.fm and move songs out of
+                                    Other/Unknown. Add --dry-run to preview.
+    python dl.py --lyrics          look for lyrics files (.lrc / .txt) for songs in the library (off in config by default)
+    python dl.py --schedule daily  run dl.py every night at 03:00 (or weekly). --schedule status, --unschedule
+    python dl.py --ego             a short portrait of your library in words
+    python dl.py --gaps            which playlist songs are missing from your library, and why
     python dl.py --playlists       build the playlist files (.m3u8). Add --dry-run to see what is combined.
     python dl.py --report          library report (sizes, formats, weakest files)
     python dl.py --colors          show the colours that are in use (KDE Plasma colours if available)
@@ -59,6 +65,7 @@ OPTIONAL
 import configparser
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -70,6 +77,8 @@ import tarfile
 import tempfile
 import time
 import traceback
+import urllib.error
+import urllib.parse
 import urllib.request
 import venv
 import zipfile
@@ -770,6 +779,47 @@ merge_similar = yes
 # Folder for the playlist files, inside your music folder. A full path also works.
 folder = Playlists
 
+# yes = also make "smart" playlists from your tags, in Playlists/Smart: one per genre folder, decade,
+# language (by the alphabet of the title) and favourite artist (10+ songs). Only lists with
+# smart_min or more songs are made (language and artist lists need 10).
+smart_playlists = yes
+smart_min = 25
+
+# yes = after each run, check which songs of your playlists are missing from the library and why
+# (no match, DRM, blocked, not downloaded yet). Saved to playlist-gaps.txt in the state folder.
+# Run it by hand with:  dl.py --gaps
+gap_report = yes
+
+[genres]
+# Songs in the folders Other and Unknown, and songs with no genre tag, get a genre from the web
+# (MusicBrainz, free, or Last.fm). The genre is written into the file and the song moves to the
+# matching genre folder. Every move is written to genre-repair-log.txt in the state folder.
+# Preview:  dl.py --genres --dry-run      Do it now:  dl.py --genres
+genre_repair = yes
+
+# How many artists to look up per run. MusicBrainz allows one question a second, so 100 takes a few
+# minutes. The answers are saved, so every run finishes more of the library.
+genre_repair_limit = 100
+
+# OPTIONAL - a free Last.fm API key (last.fm/api). It is faster and has more tags than MusicBrainz.
+lastfm_api_key =
+
+[lyrics]
+# yes = after a run has finished, look for lyrics for the songs that are in your library and save them
+# next to the song: song.lrc (timed, scrolls along in many players) or song.txt (plain).
+# Songs that did not download get nothing. Default: no.   By hand:  dl.py --lyrics
+lyrics = no
+
+# Where to look, in this order. lrclib = free, timed lyrics. synced = several lyrics sites through the
+# syncedlyrics package that spotDL installs. genius = needs genius_token below.
+lyrics_sources = lrclib synced
+
+# How many songs to look up per run. A song with no result is asked again after 30 days.
+lyrics_limit = 300
+
+# OPTIONAL - your own Genius API access token (genius.com/api-clients).
+genius_token =
+
 [display]
 # Coloured text on screen (cyan = good, yellow = warning, bold red = problem).
 # The log files never contain colours.
@@ -920,6 +970,13 @@ def load_config():
         except ValueError:
             sys.exit(f"config.ini: [timing] {key} must be a whole number.")
 
+    def number_in(section, key, default):
+        v = cp.get(section, key, fallback="").strip()
+        try:
+            return int(v) if v else default
+        except ValueError:
+            sys.exit(f"config.ini: [{section}] {key} must be a whole number.")
+
     def yes_no(key, default, section="sorting"):
         v = cp.get(section, key, fallback="").strip().lower()
         if not v:
@@ -957,6 +1014,16 @@ def load_config():
         "auto_update": yes_no("auto_update", True, "updates"),
         "color": cp.get("display", "color", fallback="auto").strip().lower() or "auto",
         "theme": cp.get("display", "theme", fallback="auto").strip().strip("\"'") or "default",
+        "gen_repair": yes_no("genre_repair", True, "genres"),
+        "gen_limit": number_in("genres", "genre_repair_limit", 100),
+        "lastfm_key": cp.get("genres", "lastfm_api_key", fallback="").strip(),
+        "gap_report": yes_no("gap_report", True, "playlists"),
+        "smart": yes_no("smart_playlists", True, "playlists"),
+        "smart_min": number_in("playlists", "smart_min", 25),
+        "lyrics": yes_no("lyrics", False, "lyrics"),
+        "lyrics_sources": [w.lower() for w in cp.get("lyrics", "lyrics_sources", fallback="lrclib synced genius").replace(",", " ").split()],
+        "lyrics_limit": number_in("lyrics", "lyrics_limit", 300),
+        "genius_token": cp.get("lyrics", "genius_token", fallback="").strip(),
         "pl_files": yes_no("playlist_files", True, "playlists"),
         "pl_merge": yes_no("merge_similar", True, "playlists"),
         "pl_folder": cp.get("playlists", "folder", fallback="Playlists").strip().strip("\"'") or "Playlists",
@@ -1019,7 +1086,7 @@ def load_ids(path, flags=None):
                 pid, rest = pid[:22], pid[22:] + " " + rest
         rest = re.sub(r"^\?\S*", "", rest.strip(" ,;")).strip(" ,;")
         fm = re.match(r"^([PSXpsx])?\s*(?:=\s*(.+))?$", rest)
-        flag, group = (fm.group(1) or "").upper(), (fm.group(2) or "").strip() if fm else ("", "")
+        flag, group = ((fm.group(1) or "").upper(), (fm.group(2) or "").strip()) if fm else ("", "")
         where = f"{path.name} line {n}"
         if pid.startswith("37i9dQZF"):
             print(f"SKIPPED {where}: Spotify-made playlists do not work ({pid})")
@@ -1030,8 +1097,9 @@ def load_ids(path, flags=None):
             ids.append(pid)
             if flags is not None:
                 flags[pid] = (flag, group)
-        elif flags is not None and flag == "P" and flags.get(pid, ("", ""))[0] != "P":
-            flags[pid] = (flag, group or flags[pid][1])           # the same ID twice: P wins
+        elif flags is not None:                                   # the same ID twice: P wins, a group fills in
+            old_flag, old_group = flags.get(pid, ("", ""))
+            flags[pid] = ("P" if "P" in (flag, old_flag) else (flag or old_flag), old_group or group)
     return ids
 
 
@@ -1692,6 +1760,7 @@ def _upgrade_batches(todo, index, tmp, js, log, pending, mutagen_file):
 # copy that is already in a genre folder, then the oldest file.
 # Optional (config.ini [dedupe] fingerprint = yes): audio fingerprints also find copies
 # whose names differ. They are compared between songs of the same artist.
+CACHE_V = 3                      # version of dedupe-cache.json (3 added the date tag)
 BROKEN_DIR = "_Broken"           # inside _Duplicates: empty or unreadable files, leftovers
 FP_URL = "https://github.com/acoustid/chromaprint/releases/download/v1.5.1/chromaprint-fpcalc-1.5.1-"
 FP_SHA256 = {                               # of the files at FP_URL, so a changed download is refused
@@ -1749,7 +1818,7 @@ def _dd_probe(mutagen_file, path):
             kbps = st.st_size * 8 / length / 1000
         return {"size": st.st_size, "mtime": st.st_mtime, "len": length, "kbps": round(kbps),
                 "ll": path.suffix.lower() in (".flac", ".wav"), "artist": one("artist") or one("albumartist"),
-                "title": one("title"), "album": one("album"), "genre": one("genre"),
+                "title": one("title"), "album": one("album"), "genre": one("genre"), "date": one("date"),
                 "url": _spotify_url(mutagen_file, path) or ""}
     except Exception:
         return None
@@ -1917,12 +1986,27 @@ def _dd_unique(path):
     return path.with_name(f"{path.stem} ({n}){path.suffix}")
 
 
+SIDECARS = (".lrc", ".txt")          # lyrics files that sit next to a song
+
+
+def _move_sidecars(src, dest):
+    "Move the lyrics files of a song along with it."
+    for ext in SIDECARS:
+        side = src.with_suffix(ext)
+        if side.is_file():
+            try:
+                shutil.move(str(side), str(dest.with_suffix(ext)))
+            except OSError:
+                pass
+
+
 def _dd_move(src, music_dir, sub=""):
     "Move src into _Duplicates (same folder layout). Never overwrites."
     dest = music_dir / DUP_DIR / sub / src.relative_to(music_dir)
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest = _dd_unique(dest)
     shutil.move(str(src), str(dest))
+    _move_sidecars(src, dest)
     return dest
 
 
@@ -2055,7 +2139,7 @@ def run_dedupe(cfg, dry_run=False, report_only=False, ask=False):
     cache_file = state / "dedupe-cache.json"
     try:                                         # version 2: files = {path: [mtime, size, facts]}
         raw = json.loads(cache_file.read_text(encoding="utf-8"))
-        cache = raw["files"] if raw.get("v") == 2 else {}
+        cache = raw["files"] if raw.get("v") == CACHE_V else {}
     except (OSError, ValueError, KeyError, AttributeError):
         cache = {}
     files = [f for f in audio_files(music_dir)
@@ -2202,7 +2286,7 @@ def run_dedupe(cfg, dry_run=False, report_only=False, ask=False):
 def _dd_save_cache(path, cache):
     try:
         part = path.with_name(path.name + ".part")
-        part.write_text(json.dumps({"v": 2, "files": {k: v for k, v in cache.items() if os.path.exists(k)}}),
+        part.write_text(json.dumps({"v": CACHE_V, "files": {k: v for k, v in cache.items() if os.path.exists(k)}}),
                         encoding="utf-8")
         os.replace(part, path)
     except OSError:
@@ -2340,11 +2424,8 @@ def _pl_client():
 
 def _pl_fetch(pid):
     "{'name':..., 'tracks': [[link, title, artist, seconds], ...]} for a public playlist."
-    import contextlib
-    import io
     from spotdl.types.playlist import Playlist
-    with contextlib.redirect_stdout(io.StringIO()):
-        meta, songs = Playlist.get_metadata("https://open.spotify.com/playlist/" + pid)
+    meta, songs = Playlist.get_metadata("https://open.spotify.com/playlist/" + pid)
     return {"name": meta.get("name") or pid,
             "tracks": [[x.url, x.name, x.artist, x.duration or 0] for x in songs]}
 
@@ -2354,7 +2435,7 @@ def _pl_library(music_dir, state, mutagen_file):
     cache_file = state / "dedupe-cache.json"
     try:
         raw = json.loads(cache_file.read_text(encoding="utf-8"))
-        cache = raw["files"] if raw.get("v") == 2 else {}
+        cache = raw["files"] if raw.get("v") == CACHE_V else {}
     except (OSError, ValueError, KeyError, AttributeError):
         cache = {}
     recs = []
@@ -2418,18 +2499,9 @@ class _PlLinker:
         return self._by_key((_dd_artist(artist), _dd_core(name), _dd_flags(name)), secs)
 
 
-def build_playlists(cfg, refresh=True, dry_run=False):
-    "Runs inside the private venv (it has mutagen and spotDL)."
-    flags = {}
-    ids = load_ids(cfg["playlists_file"], flags)
-    wanted = [p for p in ids if flags[p][0] in ("P", "S") or (cfg["pl_files"] and flags[p][0] != "X")]
-    if not wanted:
-        return
-    try:
-        from mutagen import File as mutagen_file
-    except ImportError:
-        return
-    music_dir, state = cfg["music_dir"], cfg["state_dir"]
+def _pl_meta(cfg, wanted, refresh):
+    "{id: {'name', 'tracks'}} for the wanted playlists, from Spotify (refresh) or the saved copy."
+    state = cfg["state_dir"]
     state.mkdir(parents=True, exist_ok=True)
     cache_file = state / "playlist-cache.json"
     try:
@@ -2447,16 +2519,41 @@ def build_playlists(cfg, refresh=True, dry_run=False):
                 return pid, _pl_fetch(pid)
             except Exception as e:
                 return pid, str(e)[:80]
-        with ThreadPoolExecutor(3) as ex:
-            for pid, res in ex.map(one, wanted):
-                if isinstance(res, dict):
-                    meta[pid] = cache[pid] = res
-                elif pid not in meta:
-                    cprint(f"WARNING: could not read playlist {pid} ({res}). It is skipped for now.")
+        import contextlib
+        import io
+        failed = []
+        with contextlib.redirect_stdout(io.StringIO()):          # once, not per thread: spotDL prints noise
+            with ThreadPoolExecutor(3) as ex:
+                for pid, res in ex.map(one, wanted):
+                    if isinstance(res, dict):
+                        meta[pid] = cache[pid] = res
+                    elif pid not in meta:
+                        failed.append((pid, res))
+        for pid, res in failed:
+            cprint(f"WARNING: could not read playlist {pid} ({res}). It is skipped for now.")
         try:
             cache_file.write_text(json.dumps(cache), encoding="utf-8")
         except OSError:
             pass
+    return meta
+
+
+def build_playlists(cfg, refresh=True, dry_run=False):
+    "Runs inside the private venv (it has mutagen and spotDL)."
+    flags = {}
+    ids = load_ids(cfg["playlists_file"], flags)
+    wanted = [p for p in ids if flags[p][0] in ("P", "S") or (cfg["pl_files"] and flags[p][0] != "X")]
+    if not wanted:
+        if cfg["smart"] and not dry_run:
+            build_smart(cfg)
+        return
+    try:
+        from mutagen import File as mutagen_file
+    except ImportError:
+        return
+    music_dir, state = cfg["music_dir"], cfg["state_dir"]
+    state.mkdir(parents=True, exist_ok=True)
+    meta = _pl_meta(cfg, wanted, refresh)
     files, skipped = plan_playlists(cfg, meta, ids, flags)
     if not files:
         print("Playlist files: nothing to do (no playlist data yet: run  dl.py --playlists).")
@@ -2478,9 +2575,10 @@ def build_playlists(cfg, refresh=True, dry_run=False):
     folder.mkdir(parents=True, exist_ok=True)
     index_file = state / "playlists-index.json"
     try:
-        old = json.loads(index_file.read_text(encoding="utf-8")).get("files", [])
+        old_index = json.loads(index_file.read_text(encoding="utf-8"))
+        old = old_index.get("files", [])
     except (OSError, ValueError, AttributeError):
-        old = []
+        old_index, old = {}, []
     written = []
     for fname, members in files.items():
         lines, seen, total, linked = ["#EXTM3U", "#PLAYLIST:" + fname], set(), 0, 0
@@ -2512,10 +2610,12 @@ def build_playlists(cfg, refresh=True, dry_run=False):
             except OSError:
                 pass
     try:
-        index_file.write_text(json.dumps({"files": written}), encoding="utf-8")
+        index_file.write_text(json.dumps({"files": written, "smart": old_index.get("smart", [])}), encoding="utf-8")
     except OSError:
         pass
     cprint(f"Playlist files saved in {folder}")
+    if cfg["smart"]:
+        build_smart(cfg, recs)
 
 
 def playlists_wanted(cfg):
@@ -2526,6 +2626,763 @@ def playlists_wanted(cfg):
     except OSError:
         return False
     return any(flags[p][0] in ("P", "S") or (cfg["pl_files"] and flags[p][0] != "X") for p in ids)
+
+
+# ---------------------------------------------------------------------
+# GENRE REPAIR
+# Songs in the folders Other and Unknown, and songs with no genre tag, get a genre from the web:
+# MusicBrainz (free, no key) or Last.fm (if you put an API key in config.ini). The tag is written
+# into the file, and songs in Other or Unknown move to the matching genre folder. Every move is
+# written to genre-repair-log.txt in the state folder, so you can undo it. Resumable: each run
+# looks up a limited number of artists and remembers the answers.
+#   dl.py --genres --dry-run     preview          dl.py --genres     do it
+GR_DIRS = ("Other", "Unknown")
+GR_RETRY_DAYS = 60                    # an artist that was not found is asked again after this long
+MB_UA = {"User-Agent": "dl.py-playlist-sync/1.0 ( https://github.com/jieke238y34/playlist-sync )",
+         "Accept": "application/json"}
+
+
+def _web_json(url, headers=None, tries=3):
+    "GET a URL and read JSON. Waits and retries when the service is busy."
+    for n in range(tries):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers or {}), timeout=25) as r:
+                return json.loads(r.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 503) and n < tries - 1:
+                time.sleep(4 * (n + 1))
+                continue
+            raise
+        except (urllib.error.URLError, OSError, ValueError):
+            if n < tries - 1:
+                time.sleep(2)
+                continue
+            raise
+
+
+def _gr_musicbrainz(artist):
+    "Genre names of an artist from MusicBrainz, most voted first. [] if it is not found."
+    want = _dd_artist(artist)
+    d = _web_json("https://musicbrainz.org/ws/2/artist/?query="
+                  + urllib.parse.quote('artist:"' + artist + '"') + "&fmt=json&limit=3", MB_UA)
+    hit = next((a for a in d.get("artists", [])
+                if a.get("score", 0) >= 90 and _dd_artist(a.get("name", "")) == want), None)
+    if hit is None:
+        return []
+    time.sleep(1.1)                                  # MusicBrainz allows one request a second
+    full = _web_json("https://musicbrainz.org/ws/2/artist/" + hit["id"] + "?inc=genres+tags&fmt=json", MB_UA)
+    out = []
+    for group in (full.get("genres", []), full.get("tags", [])):
+        out += [x["name"] for x in sorted(group, key=lambda x: -x.get("count", 0)) if x.get("name")]
+    return list(dict.fromkeys(out))
+
+
+def _gr_lastfm(artist, key):
+    d = _web_json("https://ws.audioscrobbler.com/2.0/?method=artist.gettoptags&format=json&api_key="
+                  + urllib.parse.quote(key) + "&artist=" + urllib.parse.quote(artist))
+    return [t["name"] for t in d.get("toptags", {}).get("tag", []) if int(t.get("count", 0) or 0) >= 20]
+
+
+def pick_genre(tags, rules):
+    "(tag, folder) for the first tag that maps to a genre folder other than Other, or (None, None)."
+    for tag in tags:
+        folder = folder_for_genre(tag, rules)
+        if folder and folder != DEFAULT_GENRE:
+            return tag, folder
+    return None, None
+
+
+def _save_tags(audio, path):
+    "Save easy tags and keep the ID3 version an MP3 already has."
+    if path.suffix.lower() == ".mp3":
+        from mutagen.id3 import ID3
+        v = ID3(path).version[1]
+        audio.save(v2_version=v if v in (3, 4) else 4)
+    else:
+        audio.save()
+
+
+def repair_genres(cfg, dry_run=False):
+    "Runs inside the private venv (it has mutagen)."
+    try:
+        from mutagen import File as mutagen_file
+    except ImportError:
+        return
+    music_dir, state = cfg["music_dir"], cfg["state_dir"]
+    state.mkdir(parents=True, exist_ok=True)
+    recs = [r for r in _pl_library(music_dir, state, mutagen_file) if not r["dup"]]
+    rules = _compile_rules()
+    targets = {}                                     # artist key -> [(rec, folder it is in)]
+    for r in recs:
+        rel = Path(r["p"]).relative_to(music_dir).parts
+        top = rel[0] if len(rel) > 1 else ""
+        key = _dd_artist(r["artist"])
+        if key and top and not top.startswith(("_", ".")) and (top in GR_DIRS or not r["genre"]):
+            targets.setdefault(key, []).append((r, top))
+    n_songs = sum(len(v) for v in targets.values())
+    if not n_songs:
+        print("Genre repair: every song already has a genre.")
+        return
+    cache_file = state / "genre-cache.json"
+    try:
+        cache = json.loads(cache_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cache = {}
+    now = time.time()
+    stale = lambda e: (not e["tags"]) and now - e.get("ts", 0) > GR_RETRY_DAYS * 86400
+    todo = [k for k in sorted(targets, key=lambda k: -len(targets[k]))
+            if k not in cache or stale(cache[k])]
+    batch = todo[:max(0, cfg["gen_limit"])]
+    looked = 0
+    if batch and not dry_run:
+        src = "Last.fm" if cfg["lastfm_key"] else "MusicBrainz"
+        print(f"Genre repair: asking {src} about {len(batch)} of {len(todo)} artists "
+              f"({n_songs} songs need a genre)...")
+        for k in batch:
+            name = targets[k][0][0]["artist"].split(";")[0].strip()
+            try:
+                tags = _gr_lastfm(name, cfg["lastfm_key"]) if cfg["lastfm_key"] else _gr_musicbrainz(name)
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                print(f"  {src} is busy or unreachable ({str(e)[:50]}). The rest waits for the next run.")
+                break
+            cache[k] = {"tags": tags[:8], "ts": now, "src": src}
+            looked += 1
+            time.sleep(0.3 if cfg["lastfm_key"] else 1.1)
+        try:
+            cache_file.write_text(json.dumps(cache), encoding="utf-8")
+        except OSError:
+            pass
+    tagged = moved = unknown = 0
+    preview = []
+    log_lines = []
+    for k, items in targets.items():
+        entry = cache.get(k)
+        tag, folder = pick_genre(entry["tags"], rules) if entry else (None, None)
+        if not folder:
+            unknown += len(items)
+            continue
+        for r, top in items:
+            path = Path(r["p"])
+            go = top in GR_DIRS and top != folder
+            if dry_run:
+                preview.append(f"{r['artist'][:28]:28} -> {folder} ({tag})" + ("" if go or not r["genre"] else ""))
+                continue
+            try:
+                if not r["genre"]:
+                    audio = mutagen_file(path, easy=True)
+                    if audio is not None:
+                        if audio.tags is None:
+                            audio.add_tags()
+                        audio.tags["genre"] = tag.title()
+                        _save_tags(audio, path)
+                        tagged += 1
+                if go:
+                    dest = _dd_unique(music_dir / folder / path.name)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(path), str(dest))
+                    _move_sidecars(path, dest)
+                    moved += 1
+                    log_lines.append(f"{datetime.now():%Y-%m-%d %H:%M} | {path} -> {dest} | {tag}")
+            except Exception as e:
+                print(f"  Could not update {path.name}: {e}")
+    if log_lines:
+        with (state / "genre-repair-log.txt").open("a", encoding="utf-8") as f:
+            f.write("\n".join(log_lines) + "\n")
+    pending = len([k for k in todo if k not in cache])
+    if dry_run:
+        fixable = sum(len(targets[k]) for k in targets if cache.get(k) and pick_genre(cache[k]["tags"], rules)[1])
+        print(f"Genre repair (preview): {n_songs} songs need a genre. {fixable} can be fixed from answers already "
+              f"saved. {len(todo)} artists still have to be asked (up to {cfg['gen_limit']} per run).")
+        for line in preview[:8]:
+            print("  " + line)
+        print("Nothing was changed. Run:  dl.py --genres")
+        return
+    cprint(f"Genre repair: {tagged} tags written, {moved} songs moved out of Other/Unknown, {unknown} still unknown"
+           f"{', ' + str(pending) + ' artists left for the next run' if pending else ''}. "
+           f"Log: {state / 'genre-repair-log.txt'}")
+
+
+# ---------------------------------------------------------------------
+# SMART PLAYLISTS
+# Playlist files built from the tags, in <playlist folder>/Smart: one per genre folder, decade,
+# language (by the alphabet of the title) and favourite artist (10+ songs). Only lists with
+# enough songs are made. Settings: [playlists] smart_playlists, smart_min.
+SCRIPTS = (("Japanese", r"[぀-ヿ]"), ("Korean", r"[가-힯]"), ("Chinese", r"[一-鿿]"),
+           ("Cyrillic", r"[Ѐ-ӿ]"), ("Arabic", r"[؀-ۿ]"))
+
+
+def smart_groups(recs, music_dir, min_n):
+    "{playlist name: [songs]} for the smart playlists. Songs that were moved to _Duplicates are left out."
+    out, artists = {}, {}
+    for r in recs:
+        if r.get("dup"):
+            continue
+        rel = Path(r["p"]).relative_to(music_dir).parts
+        top = rel[0] if len(rel) > 1 else ""
+        if top and not top.startswith(("_", ".")) and top not in GR_DIRS:
+            out.setdefault(f"Genre - {top}", []).append(r)
+        m = re.match(r"(\d{4})", r.get("date") or "")
+        if m and 1900 <= int(m.group(1)) <= 2100:
+            out.setdefault(f"Decade - {int(m.group(1)) // 10 * 10}s", []).append(r)
+        text = (r["title"] or "") + (r["artist"] or "")
+        for name, rx in SCRIPTS:
+            if re.search(rx, text):
+                out.setdefault(f"Language - {name}", []).append(r)
+                break
+        key = _dd_artist(r["artist"])
+        if key:
+            artists.setdefault(key, []).append(r)
+    for key, songs in artists.items():
+        if len(songs) >= 10:
+            name = collections_most_common([x["artist"].split(";")[0].strip() for x in songs])
+            out[f"Artist - {name}"] = songs
+    keep = {}
+    for name, songs in out.items():
+        need = min_n if name.startswith(("Genre", "Decade")) else 10
+        if len(songs) >= max(1, need):
+            keep[name] = sorted(songs, key=lambda x: ((x["artist"] or "").lower(), (x["album"] or "").lower(), x["title"].lower()))
+    return keep
+
+
+def collections_most_common(items):
+    counts = {}
+    for i in items:
+        counts[i] = counts.get(i, 0) + 1
+    return max(counts, key=lambda k: counts[k])
+
+
+def _write_m3u8(target, title, songs):
+    "Write a playlist file with relative links. Returns nothing."
+    lines = ["#EXTM3U", "#PLAYLIST:" + title]
+    for r in songs:
+        try:
+            rel = os.path.relpath(r["p"], target.parent).replace("\\", "/")
+        except ValueError:                           # another drive on Windows
+            rel = Path(r["p"]).as_posix()
+        lines.append(f"#EXTINF:{int(r['len'])},{r['artist']} - {r['title'] or r['name']}")
+        lines.append(rel)
+    part = target.with_name(target.name + ".part")
+    part.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(part, target)
+
+
+def build_smart(cfg, recs=None):
+    "Runs inside the private venv."
+    try:
+        from mutagen import File as mutagen_file
+    except ImportError:
+        return
+    music_dir, state = cfg["music_dir"], cfg["state_dir"]
+    if recs is None:
+        recs = _pl_library(music_dir, state, mutagen_file)
+    folder = Path(os.path.expanduser(cfg["pl_folder"]))
+    folder = (folder if folder.is_absolute() else music_dir / folder) / "Smart"
+    groups = smart_groups(recs, music_dir, cfg["smart_min"])
+    index_file = state / "playlists-index.json"
+    try:
+        index = json.loads(index_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        index = {}
+    old, written = index.get("smart", []), []
+    if groups:
+        folder.mkdir(parents=True, exist_ok=True)
+    for name, songs in sorted(groups.items()):
+        fname = _clean_name(name) + ".m3u8"
+        _write_m3u8(folder / fname, name, songs)
+        written.append(fname)
+    for fname in old:
+        if fname not in written:
+            try:
+                (folder / fname).unlink()
+            except OSError:
+                pass
+    index["smart"] = written
+    try:
+        index_file.write_text(json.dumps(index), encoding="utf-8")
+    except OSError:
+        pass
+    if written:
+        cprint(f"Smart playlists: {len(written)} made in {folder} "
+               f"({sum(1 for n in groups if n.startswith('Genre'))} genres, "
+               f"{sum(1 for n in groups if n.startswith('Decade'))} decades, "
+               f"{sum(1 for n in groups if n.startswith('Language'))} languages, "
+               f"{sum(1 for n in groups if n.startswith('Artist'))} artists)")
+
+
+# ---------------------------------------------------------------------
+# PLAYLIST GAP REPORT
+# For every playlist: which songs are not in your library yet, and why. The reason comes from the error
+# files of the last run (no match, DRM, blocked...), your archive (downloaded before but the file is gone)
+# or "not downloaded yet". Written to playlist-gaps.txt in the state folder.
+def gap_reason(text):
+    "A short reason for a spotDL error line like 'LookupError: No results found for song: ...'."
+    t = text.lower()
+    if "drm" in t:
+        return "DRM protected"
+    if "lookuperror" in t or "no results found" in t:
+        return "no match found"
+    if re.search(r"sign in|not a bot|403|429|forbidden|too many requests|blocked", t):
+        return "blocked by YouTube (try later)"
+    if "missing required fields" in t:
+        return "incomplete Spotify data"
+    return "download failed"
+
+
+def _gap_errors(state, pid):
+    "{track id: reason} from the error file of the last run of a playlist."
+    out = {}
+    try:
+        for line in (state / f"errors-{pid}.txt").read_text(encoding="utf-8", errors="replace").splitlines():
+            m = re.search(r"open\.spotify\.com/track/([A-Za-z0-9]{22})\s*-\s*(.*)", line)
+            if m:
+                out[m.group(1)] = gap_reason(m.group(2))
+    except OSError:
+        pass
+    return out
+
+
+def gap_report(cfg):
+    "Runs inside the private venv (it has mutagen and spotDL)."
+    try:
+        from mutagen import File as mutagen_file
+    except ImportError:
+        return
+    flags = {}
+    ids = load_ids(cfg["playlists_file"], flags)
+    wanted = [p for p in ids if flags[p][0] != "X"]
+    if not wanted:
+        return
+    music_dir, state = cfg["music_dir"], cfg["state_dir"]
+    meta = _pl_meta(cfg, wanted, refresh=not (state / "playlist-cache.json").is_file())
+    linker = _PlLinker(_pl_library(music_dir, state, mutagen_file))
+    try:
+        archive = {x.strip() for x in cfg["archive_file"].read_text(encoding="utf-8", errors="replace").splitlines()}
+    except OSError:
+        archive = set()
+    rows, reasons, seen, lines = [], {}, set(), []
+    for pid in wanted:
+        if pid not in meta:
+            continue
+        errs = _gap_errors(state, pid)
+        missing = []
+        for track in meta[pid]["tracks"]:
+            if linker.find(track) is not None:
+                continue
+            tid = track[0].rsplit("/", 1)[-1]
+            why = errs.get(tid) or ("in your archive, but the file is gone" if track[0] in archive else "not downloaded yet")
+            missing.append((track, why))
+            if track[0] not in seen:
+                seen.add(track[0])
+                reasons[why] = reasons.get(why, 0) + 1
+        total = len(meta[pid]["tracks"])
+        rows.append((len(missing), total, meta[pid]["name"], pid))
+        lines.append(f"== {meta[pid]['name']} ({pid}): {total - len(missing)} of {total} in the library")
+        lines += [f"   {why:36} {t[2]} - {t[1]}" for t, why in missing]
+        lines.append("")
+    (state / "playlist-gaps.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    all_tracks = {t[0] for pid in wanted if pid in meta for t in meta[pid]["tracks"]}
+    gone = len(seen)
+    print(paint("Playlist gaps:", "bold") + f" {len(all_tracks) - gone} of {len(all_tracks)} songs from your playlists are in "
+          f"the library, {gone} are missing.")
+    for why, n in sorted(reasons.items(), key=lambda x: -x[1]):
+        print(f"  {n:6} {why}")
+    for miss, total, name, pid in sorted(rows, reverse=True)[:5]:
+        if miss:
+            print(f"  most missing: {name[:38]} ({total - miss} of {total}, {100 * (total - miss) // max(total, 1)}%)")
+    print(f"Saved to: {state / 'playlist-gaps.txt'}")
+
+
+# ---------------------------------------------------------------------
+# LYRICS (off by default: [lyrics] lyrics = yes)
+# After a run has finished, songs that are in your library and have no lyrics file get one, saved next to
+# the song with the same name: song.lrc (timed, for players that scroll along) or song.txt (plain).
+# Sources, in the order of lyrics_sources: lrclib (free, timed), synced (the syncedlyrics package that
+# spotDL installs: several sites), genius (needs your own access token). A song with no result is asked
+# again after 30 days. Each run handles at most lyrics_limit songs.  dl.py --lyrics  runs it by hand.
+LYRICS_RETRY_DAYS = 30
+LR_UA = {"User-Agent": "dl.py-playlist-sync/1.0 ( https://github.com/jieke238y34/playlist-sync )"}
+
+
+def lyrics_kind(text):
+    "'lrc' if the text has time stamps like [01:23.45], else 'txt'."
+    return "lrc" if re.search(r"(?m)^\s*\[\d{1,3}:\d{2}", text or "") else "txt"
+
+
+def _lyr_lrclib(artist, title, album, secs):
+    q = urllib.parse.urlencode({"artist_name": artist, "track_name": title, "album_name": album or "",
+                                "duration": int(secs)})
+    d = None
+    try:
+        d = _web_json("https://lrclib.net/api/get?" + q, LR_UA, tries=2)
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+    if not d:
+        res = _web_json("https://lrclib.net/api/search?" + urllib.parse.urlencode(
+            {"track_name": title, "artist_name": artist}), LR_UA, tries=2)
+        d = next((x for x in res if abs((x.get("duration") or 0) - secs) <= 4), None)
+    return ((d or {}).get("syncedLyrics") or (d or {}).get("plainLyrics") or "").strip()
+
+
+def _lyr_synced(artist, title):
+    import syncedlyrics
+    return (syncedlyrics.search(f"{title} {artist}") or "").strip()
+
+
+def _lyr_genius(artist, title, token):
+    from spotdl.providers.lyrics import Genius
+    return (Genius(token).get_lyrics(title, [artist]) or "").strip()
+
+
+def find_lyrics(cfg, artist, title, album, secs):
+    "The lyrics text from the first source that has it, or ''."
+    for src in cfg["lyrics_sources"]:
+        try:
+            if src == "lrclib":
+                text = _lyr_lrclib(artist, title, album, secs)
+            elif src == "synced":
+                text = _lyr_synced(artist, title)
+            elif src == "genius" and cfg["genius_token"]:
+                text = _lyr_genius(artist, title, cfg["genius_token"])
+            else:
+                continue
+        except Exception:
+            continue
+        if len(text) > 40:
+            return text
+    return ""
+
+
+def fetch_lyrics(cfg, dry_run=False):
+    "Runs inside the private venv (it has mutagen and spotDL)."
+    try:
+        from mutagen import File as mutagen_file
+    except ImportError:
+        return
+    music_dir, state = cfg["music_dir"], cfg["state_dir"]
+    recs = [r for r in _pl_library(music_dir, state, mutagen_file) if not r["dup"]]
+    cache_file = state / "lyrics-cache.json"
+    try:
+        misses = json.loads(cache_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        misses = {}
+    now = time.time()
+    todo = [r for r in recs if r["artist"] and r["title"]
+            and not any(Path(r["p"]).with_suffix(e).exists() for e in SIDECARS)
+            and now - misses.get(r["p"], 0) > LYRICS_RETRY_DAYS * 86400]
+    batch = todo[:max(0, cfg["lyrics_limit"])]
+    if dry_run:
+        print(f"Lyrics (preview): {len(todo)} songs have no lyrics file. {len(batch)} would be asked this run "
+              f"(sources: {' '.join(cfg['lyrics_sources'])}).")
+        return
+    if not batch:
+        print("Lyrics: every song already has a lyrics file, or was tried recently.")
+        return
+    print(f"Lyrics: looking for {len(batch)} of {len(todo)} songs ({' '.join(cfg['lyrics_sources'])})...")
+    got = {"lrc": 0, "txt": 0}
+    for n, r in enumerate(batch, 1):
+        text = find_lyrics(cfg, r["artist"].split(";")[0].strip(), r["title"], r["album"], r["len"])
+        if text:
+            kind = lyrics_kind(text)
+            try:
+                Path(r["p"]).with_suffix("." + kind).write_text(text + "\n", encoding="utf-8")
+                got[kind] += 1
+            except OSError:
+                pass
+        else:
+            misses[r["p"]] = now
+        if n % 50 == 0:
+            print(f"  {n} of {len(batch)}...")
+            try:
+                cache_file.write_text(json.dumps(misses), encoding="utf-8")
+            except OSError:
+                pass
+        time.sleep(0.3)
+    try:
+        cache_file.write_text(json.dumps(misses), encoding="utf-8")
+    except OSError:
+        pass
+    cprint(f"Lyrics: {got['lrc']} timed (.lrc) and {got['txt']} plain (.txt) files written, "
+           f"{len(batch) - got['lrc'] - got['txt']} songs without a result.")
+
+
+# ---------------------------------------------------------------------
+# SCHEDULED RUNS (off unless you ask)
+#   dl.py --schedule daily | weekly     run dl.py by itself at 03:00
+#   dl.py --schedule status             is it scheduled?
+#   dl.py --unschedule                  remove it
+# Linux uses a systemd user timer (or cron if there is none), macOS launchd, Windows Task Scheduler.
+SCHED = "dl-playlist-sync"
+
+
+def schedule_files(when, python, script):
+    "The text of the files a scheduler needs, as {name: text}. when is daily or weekly."
+    workdir = str(Path(script).parent)
+    return {
+        SCHED + ".service": f"[Unit]\nDescription=dl.py playlist sync\n\n[Service]\nType=oneshot\n"
+                            f"WorkingDirectory={workdir}\nExecStart={python} {shlex.quote(str(script))}\n",
+        SCHED + ".timer": f"[Unit]\nDescription=dl.py playlist sync ({when})\n\n[Timer]\n"
+                          f"OnCalendar={'*-*-* 03:00:00' if when == 'daily' else 'Sun *-*-* 03:00:00'}\n"
+                          "Persistent=true\nRandomizedDelaySec=10min\n\n[Install]\nWantedBy=timers.target\n",
+        "cron": f"{'0 3 * * *' if when == 'daily' else '0 3 * * 0'} cd {shlex.quote(workdir)} && {python} "
+                f"{shlex.quote(str(script))}  # {SCHED}",
+        "plist": '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>\n'
+                 f"<key>Label</key><string>{SCHED}</string>\n<key>ProgramArguments</key><array>"
+                 f"<string>{python}</string><string>{script}</string></array>\n"
+                 f"<key>WorkingDirectory</key><string>{workdir}</string>\n<key>StartCalendarInterval</key><dict>"
+                 f"{'<key>Weekday</key><integer>0</integer>' if when == 'weekly' else ''}"
+                 "<key>Hour</key><integer>3</integer><key>Minute</key><integer>0</integer></dict>\n</dict></plist>\n",
+    }
+
+
+def _run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def schedule_cmd(action):
+    "action: daily, weekly, status or off. Returns a message."
+    script, python = Path(__file__).resolve(), sys.executable
+    files = schedule_files(action if action in ("daily", "weekly") else "daily", python, script)
+    home = Path.home()
+    if os.name == "nt":
+        if action == "status":
+            r = _run(["schtasks", "/Query", "/TN", SCHED])
+            return "scheduled (Task Scheduler)" if r.returncode == 0 else "not scheduled"
+        if action == "off":
+            _run(["schtasks", "/Delete", "/TN", SCHED, "/F"])
+            return "Removed the scheduled task."
+        r = _run(["schtasks", "/Create", "/F", "/TN", SCHED, "/SC", action.upper(), "/ST", "03:00",
+                  "/TR", f'"{python}" "{script}"'])
+        return f"Scheduled {action} at 03:00 (Task Scheduler)." if r.returncode == 0 else "Failed: " + r.stderr.strip()
+    if sys.platform == "darwin":
+        plist = home / "Library" / "LaunchAgents" / (SCHED + ".plist")
+        if action == "status":
+            return f"scheduled (launchd: {plist})" if plist.exists() else "not scheduled"
+        if action == "off":
+            _run(["launchctl", "unload", str(plist)])
+            plist.unlink(missing_ok=True)
+            return "Removed the scheduled run."
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        plist.write_text(files["plist"], encoding="utf-8")
+        _run(["launchctl", "unload", str(plist)])
+        r = _run(["launchctl", "load", str(plist)])
+        return f"Scheduled {action} at 03:00 (launchd)." if r.returncode == 0 else "Failed: " + r.stderr.strip()
+    unit = home / ".config" / "systemd" / "user"
+    has_systemd = shutil.which("systemctl") and _run(["systemctl", "--user", "show-environment"]).returncode == 0
+    if has_systemd:
+        if action == "status":
+            r = _run(["systemctl", "--user", "list-timers", SCHED + ".timer", "--no-pager"])
+            return "scheduled (systemd user timer)\n" + r.stdout.strip() if (unit / (SCHED + ".timer")).exists() else "not scheduled"
+        if action == "off":
+            _run(["systemctl", "--user", "disable", "--now", SCHED + ".timer"])
+            for ext in (".service", ".timer"):
+                (unit / (SCHED + ext)).unlink(missing_ok=True)
+            _run(["systemctl", "--user", "daemon-reload"])
+            return "Removed the scheduled run."
+        unit.mkdir(parents=True, exist_ok=True)
+        for ext in (".service", ".timer"):
+            (unit / (SCHED + ext)).write_text(files[SCHED + ext], encoding="utf-8")
+        _run(["systemctl", "--user", "daemon-reload"])
+        r = _run(["systemctl", "--user", "enable", "--now", SCHED + ".timer"])
+        return (f"Scheduled {action} at 03:00 (systemd user timer). Runs only while you are logged in, unless you "
+                f"run: loginctl enable-linger {os.environ.get('USER', '')}") if r.returncode == 0 else "Failed: " + r.stderr.strip()
+    cur = _run(["crontab", "-l"]).stdout if shutil.which("crontab") else ""
+    kept = "\n".join(x for x in cur.splitlines() if "# " + SCHED not in x)
+    if action == "status":
+        return "scheduled (cron)" if "# " + SCHED in cur else "not scheduled"
+    if action != "off":
+        kept = (kept + "\n" if kept else "") + files["cron"]
+    r = subprocess.run(["crontab", "-"], input=kept + "\n", capture_output=True, text=True)
+    if r.returncode != 0:
+        return "Failed: " + r.stderr.strip()
+    return "Removed the scheduled run." if action == "off" else f"Scheduled {action} at 03:00 (cron)."
+
+
+# ---------------------------------------------------------------------
+# --ego: a short portrait of your library, in words. Everything comes from your own tags and playlist names.
+MOODS = (("autumn / fall", r"autumn|fall\b"), ("winter", r"winter|snow|christmas"), ("summer", r"summer|beach"),
+         ("spring", r"spring"), ("the gym", r"gym|workout|lift"), ("late nights", r"night|3:33|insomnia|sleep"),
+         ("gaming", r"rocket league|gaming|minecraft|skyrim"), ("nostalgia", r"nostalg|throwback|old school|forgot"),
+         ("driving and travel", r"road trip|drive|driving|europe"), ("studying and focus", r"study|focus|lo-?fi"))
+
+
+def library_stats(recs, music_dir, playlist_names=()):
+    "Numbers about a library, for --ego. recs: song records (not in _Duplicates)."
+    artists, folders, albums, scripts, decades = {}, {}, set(), {}, {}
+    for r in recs:
+        key = _dd_artist(r["artist"])
+        if key:
+            artists.setdefault(key, [0, r["artist"].split(";")[0].strip()])[0] += 1
+        rel = Path(r["p"]).relative_to(music_dir).parts
+        top = rel[0] if len(rel) > 1 else ""
+        if top and not top.startswith(("_", ".")):
+            folders[top] = folders.get(top, 0) + 1
+        if r["album"]:
+            albums.add(r["album"].lower())
+        text = (r["title"] or "") + (r["artist"] or "")
+        for name, rx in SCRIPTS:
+            if re.search(rx, text):
+                scripts[name] = scripts.get(name, 0) + 1
+                break
+        m = re.match(r"(\d{4})", r.get("date") or "")
+        if m and 1900 <= int(m.group(1)) <= 2100:
+            decades[int(m.group(1)) // 10 * 10] = decades.get(int(m.group(1)) // 10 * 10, 0) + 1
+    n = len(recs)
+    counts = sorted(artists.values(), key=lambda x: -x[0])
+    return {"songs": n, "hours": sum(r["len"] for r in recs) / 3600, "artists": len(artists), "albums": len(albums),
+            "one_share": sum(1 for c, _ in counts if c == 1) / max(len(counts), 1),
+            "top10_share": sum(c for c, _ in counts[:10]) / max(n, 1), "top": [(a, c) for c, a in counts[:8]],
+            "folders": sorted(folders.items(), key=lambda x: -x[1]), "scripts": scripts, "decades": decades,
+            "unsorted": sum(folders.get(d, 0) for d in GR_DIRS) / max(n, 1),
+            "playlists": list(playlist_names)}
+
+
+def ego_items(st):
+    "The portrait as a list of {label, text, bars, hist, kind}. ego_text and ego_pretty both draw it."
+    if not st["songs"]:
+        return [{"label": "Library", "text": "There are no songs in your library yet, so there is nothing to describe. "
+                 "Run dl.py first."}]
+    out = [{"label": "Library", "text": f"{st['songs']:,} songs, about {st['hours']:.0f} hours ({st['hours'] / 24:.1f} days "
+            f"of non-stop playing), {st['artists']:,} artists and {st['albums']:,} albums."}]
+    if st["one_share"] >= 0.7 and st["top10_share"] <= 0.12:
+        out.append({"label": "Style", "bars": [("one-song artists", st["one_share"]), ("your top 10 artists", st["top10_share"])],
+                    "text": f"It is discovery-driven: {st['one_share']:.0%} of your artists have just one song and your ten "
+                            f"biggest artists make up only {st['top10_share']:.1%} of the library. You collect through "
+                            "playlists and moments more than through discographies."})
+    elif st["top10_share"] >= 0.25:
+        out.append({"label": "Style", "bars": [("your top 10 artists", st["top10_share"])],
+                    "text": f"It is loyal to a few artists: your ten biggest artists make up {st['top10_share']:.0%} of "
+                            "the library."})
+    else:
+        out.append({"label": "Style", "bars": [("one-song artists", st["one_share"]), ("your top 10 artists", st["top10_share"])],
+                    "text": f"It balances both: {st['one_share']:.0%} of your artists have one song, and your ten biggest "
+                            f"artists are {st['top10_share']:.0%} of the library."})
+    if st["top"]:
+        out.append({"label": "Favourites", "text": "Most collected: "
+                    + ", ".join(f"{a} ({c})" for a, c in st["top"][:6]) + "."})
+    real = [(f, c) for f, c in st["folders"] if f not in GR_DIRS]
+    total = sum(c for _, c in real) or 1
+    if real:
+        shares = [c / total for _, c in real]
+        entropy = -sum(p * math.log(p) for p in shares if p > 0) / math.log(len(shares)) if len(shares) > 1 else 0
+        spread = "very wide" if entropy >= 0.8 else "wide" if entropy >= 0.6 else "focused"
+        out.append({"label": "Genres", "bars": [(f, c / total) for f, c in real[:6]],
+                    "text": f"Genre spread is {spread}: " + ", ".join(f"{f} {100 * c // total}%" for f, c in real[:5])
+                            + (f", across {len(real)} genre folders." if len(real) > 5 else ".")})
+    if st["scripts"]:
+        out.append({"label": "Languages", "text": "Beyond Latin letters: " + ", ".join(
+            f"{n} titles in {k}" for k, n in sorted(st["scripts"].items(), key=lambda x: -x[1])) + "."})
+    known = sum(st["decades"].values())
+    if known >= 100:
+        top_dec = max(st["decades"], key=st["decades"].get)
+        out.append({"label": "Eras", "hist": dict(sorted(st["decades"].items())),
+                    "text": f"{len(st['decades'])} decades from the {min(st['decades'])}s to the {max(st['decades'])}s; "
+                            f"the {top_dec}s lead with {100 * st['decades'][top_dec] // known}% of the songs that have a date."})
+    names = " ".join(st["playlists"]).lower()
+    found = [label for label, rx in MOODS if re.search(rx, names)]
+    if found:
+        out.append({"label": "Moods", "text": "Moods and moments in your playlist names: " + ", ".join(found) + "."})
+    if st["unsorted"] >= 0.05:
+        out.append({"label": "Careful", "kind": "warn",
+                    "text": f"{st['unsorted']:.0%} of the songs sit in Other/Unknown folders, so the genre picture is "
+                            "partly missing tags, not taste. dl.py --genres can fill many of them in."})
+    out.append({"label": "Note", "kind": "dim",
+                "text": "This is a snapshot of the tags in your library, not of everything you like."})
+    return out
+
+
+def ego_text(st):
+    "The portrait as plain sentences."
+    return [i["text"] for i in ego_items(st)]
+
+
+def cassette(top, mid, low):
+    "A cassette tape in ASCII (screws, spoked reels, label stripe, tape heads), every row 53 wide."
+    w = 50
+
+    def body(inner):                      # one row of the outer shell
+        return " |" + inner.center(w)[:w] + "|"
+    reel = [" .-----. ",
+            "/ \\ | / \\",
+            "|--(o)--|",
+            "\\ / | \\ /",
+            " '-----' "]
+    gap = 44 - 2 - 2 * len(reel[0])       # room for the text between the reels
+    texts = ["", top, mid, low, ""]
+    rows = [" ." + "-" * w + ".",
+            body(" (+)" + " " * 40 + "(+) "),
+            body("  ." + "-" * 44 + ".  "),
+            body("  |" + (" " + ":" * 42 + " ") + "|  ")]
+    for i in range(5):
+        c = " " + reel[i] + texts[i].center(gap) + reel[i] + " "
+        rows.append(body("  |" + c + "|  "))
+    rows += [body("  '" + "-" * 44 + "'  "),
+             body(" (+)" + " " * 40 + "(+) "),
+             body("  _/" + "_" * 40 + "\\_  "),
+             body(" /  o  ." + "-" * 10 + "[]" + "-" * 4 + "[]" + "-" * 8 + "[]" + "-" * 5 + ".  o  \\ "),
+             " '" + "-" * w + "'"]
+    return rows
+
+
+def equalizer(width=52, unicode_ok=True):
+    "A row of bars like a graphic equalizer (deterministic)."
+    if not unicode_ok:
+        return "|".join("" for _ in range(1)) + "".join("|!:."[(int(2 + 1.9 * math.sin(i * 0.7)) % 4)] for i in range(width))
+    blocks = "▁▂▃▄▅▆▇█"
+    return "".join(blocks[int((math.sin(i * 0.7) + math.sin(i * 0.31 + 1) + 2) / 4 * 7.99)] for i in range(width))
+
+
+def _bar(frac, width, unicode_ok):
+    n = max(0, min(width, round(frac * width)))
+    full, empty = ("█", "░") if unicode_ok else ("#", "-")
+    return paint(full * n, "ok") + paint(empty * (width - n), "dim")
+
+
+def ego_pretty(st, unicode_ok=True):
+    "The portrait decorated for a terminal: cassette art, equalizer, bars. Returns a list of lines."
+    import textwrap
+    lines = [""]
+    if st["songs"]:
+        hours = f"{st['hours']:.0f} hours"
+        lines += [paint("   " + l, "ok") for l in cassette("S O N G S", f"{st['songs']:,}", hours)]
+        lines.append(paint("   " + equalizer(52, unicode_ok), "err"))
+    note = "♪" if unicode_ok else "~"
+    lines += ["", paint(f"   {note}  Y O U R   L I B R A R Y ,   I N   W O R D S  {note}", "bold"),
+              paint("   " + ("─" if unicode_ok else "-") * 52, "dim"), ""]
+    dot = " · " if unicode_ok else " | "
+    for item in ego_items(st):
+        label = paint(f"{item['label']:<11}", "warn" if item.get("kind") == "warn" else "bold")
+        wrapped = textwrap.wrap(item["text"], 62) or [""]
+        tint = {"warn": "warn", "dim": "dim"}.get(item.get("kind"))
+        lines.append("   " + label + (paint(wrapped[0], tint) if tint else wrapped[0]))
+        lines += ["   " + " " * 11 + (paint(w, tint) if tint else w) for w in wrapped[1:]]
+        for name, frac in item.get("bars", []):
+            lines.append("   " + " " * 11 + f"{name[:19]:<19} {_bar(frac, 22, unicode_ok)} {frac:>5.0%}")
+        if item.get("hist"):
+            h = item["hist"]
+            top = max(h.values())
+            blocks = "▁▂▃▄▅▆▇█" if unicode_ok else ".:-=+*#@"
+            bars = "".join(blocks[min(7, int(v / top * 7.99))] for v in h.values())
+            lines.append("   " + " " * 11 + paint(bars, "ok") + f"   {min(h)}s{dot}{max(h)}s")
+        lines.append("")
+    return lines
+
+
+def run_ego(cfg):
+    "Runs inside the private venv."
+    try:
+        from mutagen import File as mutagen_file
+    except ImportError:
+        return
+    recs = [r for r in _pl_library(cfg["music_dir"], cfg["state_dir"], mutagen_file) if not r["dup"]]
+    names = []
+    try:
+        names = [v["name"] for v in json.loads((cfg["state_dir"] / "playlist-cache.json").read_text(encoding="utf-8")).values()]
+    except (OSError, ValueError, KeyError):
+        pass
+    unicode_ok = "utf" in (getattr(sys.stdout, "encoding", "") or "").lower()
+    for line in ego_pretty(library_stats(recs, cfg["music_dir"], names), unicode_ok):
+        print(line)
 
 
 def run_inner(py, *args):
@@ -2771,13 +3628,25 @@ def main():
         say("Sorting songs into genre folders...")
         run_sorter(py)
 
+    if cfg["gen_repair"]:
+        say("Repairing missing genres...")
+        run_inner(py, "--genres-inner")
+
     if playlists_wanted(cfg):
         say("Building playlist files...")
         run_inner(py, "--playlists-inner")
 
+    if cfg["gap_report"] and playlists_wanted(cfg):
+        say("Checking which playlist songs are missing...")
+        run_inner(py, "--gaps-inner")
+
     if cfg["dd_preview"]:
         say("Checking for duplicate songs (preview only, nothing is moved)...")
         run_inner(py, "--dedupe-inner", "--dry-run", "--no-ask")
+
+    if cfg["lyrics"]:                              # last: only songs that really are in the library
+        say("Looking for lyrics...")
+        run_inner(py, "--lyrics-inner")
 
 
 if __name__ == "__main__":
@@ -2785,14 +3654,16 @@ if __name__ == "__main__":
     try:
         _c = load_config()
         init_color(_c["color"], _c["theme"], quiet=any(a.endswith("-inner") for a in args))
-        rest = [a for i, a in enumerate(args) if not (i and args[i - 1] == "--colors" and not a.startswith("-"))]
+        rest = [a for i, a in enumerate(args) if not (i and args[i - 1] in ("--colors", "--schedule") and not a.startswith("-"))]
         known = {"-h", "--help", "--sort", "--dry-run", "--upgrade", "--dedupe", "--report",
                  "--sort-inner", "--seed-inner", "--upgrade-inner", "--dedupe-inner", "--report-only",
-                 "--no-ask", "--colors", "--themes", "--playlists", "--playlists-inner", "--cached"}
+                 "--no-ask", "--colors", "--themes", "--playlists", "--playlists-inner", "--cached", "--genres", "--genres-inner", "--gaps", "--gaps-inner",
+                 "--lyrics", "--lyrics-inner", "--ego", "--ego-inner", "--schedule", "--unschedule"}
         if "-h" in args or "--help" in args:
             print(__doc__)
-        elif set(rest) - known or ("--dry-run" in args and not {"--sort", "--sort-inner", "--dedupe", "--dedupe-inner", "--playlists", "--playlists-inner"} & set(args)):
-            sys.exit("Usage: dl.py [--sort | --dedupe | --playlists [--dry-run]] [--report] [--upgrade] [--colors [NAME]] [--themes] [--help]\n"
+        elif set(rest) - known or ("--dry-run" in args and not {"--sort", "--sort-inner", "--dedupe", "--dedupe-inner", "--playlists", "--playlists-inner", "--genres", "--genres-inner", "--lyrics", "--lyrics-inner"} & set(args)):
+            sys.exit("Usage: dl.py [--sort | --dedupe | --playlists | --genres | --lyrics [--dry-run]] [--gaps] [--report] [--upgrade]\n"
+                     "              [--ego] [--schedule daily|weekly|status|off] [--unschedule] [--colors [NAME]] [--themes] [--help]\n"
                      "(unknown option, or --dry-run used without --sort)")
         elif "--sort-inner" in args:            # runs inside the private venv (has mutagen)
             _cfg = load_config()
@@ -2802,6 +3673,40 @@ if __name__ == "__main__":
         elif "--colors" in args:                # show the colours in use, or preview a scheme
             i = args.index("--colors")
             show_colors(args[i + 1] if i + 1 < len(args) and not args[i + 1].startswith("-") else None)
+        elif "--lyrics-inner" in args:          # runs inside the private venv (has mutagen, spotDL)
+            fetch_lyrics(load_config(), "--dry-run" in args)
+        elif "--lyrics" in args:
+            create_missing_files(need_playlists=False)
+            _cfg = load_config()
+            run_inner(ensure_spotdl(_cfg["venv_dir"]), "--lyrics-inner",
+                      *(["--dry-run"] if "--dry-run" in args else []))
+        elif "--ego-inner" in args:
+            run_ego(load_config())
+        elif "--ego" in args:
+            create_missing_files(need_playlists=False)
+            _cfg = load_config()
+            run_inner(ensure_spotdl(_cfg["venv_dir"]), "--ego-inner")
+        elif "--unschedule" in args:
+            print(schedule_cmd("off"))
+        elif "--schedule" in args:
+            i = args.index("--schedule")
+            when = args[i + 1] if i + 1 < len(args) and not args[i + 1].startswith("-") else "status"
+            if when not in ("daily", "weekly", "status", "off"):
+                sys.exit("Usage: dl.py --schedule daily | weekly | status | off")
+            print(schedule_cmd(when))
+        elif "--gaps-inner" in args:            # runs inside the private venv (has mutagen, spotDL)
+            gap_report(load_config())
+        elif "--gaps" in args:
+            create_missing_files(need_playlists=True)
+            _cfg = load_config()
+            run_inner(ensure_spotdl(_cfg["venv_dir"]), "--gaps-inner")
+        elif "--genres-inner" in args:          # runs inside the private venv (has mutagen)
+            repair_genres(load_config(), "--dry-run" in args)
+        elif "--genres" in args:
+            create_missing_files(need_playlists=False)
+            _cfg = load_config()
+            run_inner(ensure_spotdl(_cfg["venv_dir"]), "--genres-inner",
+                      *(["--dry-run"] if "--dry-run" in args else []))
         elif "--playlists-inner" in args:       # runs inside the private venv (has mutagen, spotDL)
             build_playlists(load_config(), refresh="--cached" not in args, dry_run="--dry-run" in args)
         elif "--playlists" in args:

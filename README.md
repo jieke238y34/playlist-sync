@@ -20,7 +20,13 @@ downloads ffmpeg if your system has none.
 - **Duplicate finder**: same song on different albums, remasters and name variants are found, the best
   quality copy stays, live and remix versions are kept, and nothing is ever deleted. Optional audio
   fingerprints.
-- **Genre sorting** into folders, with your own `Artist=Folder` rules.
+- **Genre sorting** into folders, with your own `Artist=Folder` rules, and **genre repair** that fills in missing
+  genres from MusicBrainz or Last.fm and moves songs out of `Other` and `Unknown`.
+- **Smart playlists** made from your tags (genre, decade, language, favourite artists) and a **gap report**
+  that shows which playlist songs are missing from your library and why.
+- **Lyrics files** (`.lrc` timed or `.txt`) from LRCLIB and other sources, off by default.
+- **`--ego`**: a short portrait of your library in words, with a cassette-tape header.
+- **Scheduled runs** with one command (systemd, cron, launchd or Windows Task Scheduler), off by default.
 - **Library report and cleanup**: songs, hours, size, formats, weakest files, broken files, empty folders.
 - **Progress with an ETA**: a rough time left and finish time after each song.
 - **Colour themes**: readable colours by default, or copy any installed KDE colour scheme.
@@ -58,6 +64,11 @@ IDs starting `37i9dQZF`) do not work: copy their songs into your own public play
 | `python dl.py --dedupe --dry-run` | Short summary, then type `--expand` to list the duplicates, `--dedupe` to move them, or `--exit` |
 | `python dl.py --dedupe` | Move duplicate songs to `_Duplicates/` straight away (nothing is deleted) |
 | `python dl.py --playlists` | Build the playlist files now. Add `--dry-run` to see what would be combined. |
+| `python dl.py --genres` | Fill in missing genres and move songs out of Other/Unknown. `--dry-run` previews. |
+| `python dl.py --gaps` | Which playlist songs are missing from your library, and why |
+| `python dl.py --lyrics` | Look for lyrics files for the songs in your library (off by default in config) |
+| `python dl.py --ego` | A portrait of your library in words |
+| `python dl.py --schedule daily` | Run dl.py every night at 03:00 (`weekly`, `status`, or `--unschedule`) |
 | `python dl.py --report` | Library report: songs, hours, size, formats, folders, weakest files |
 | `python dl.py --upgrade` | Run only the SoundCloud upgrade step for songs still waiting |
 | `python dl.py --colors [NAME]` | Show the colours in use, or preview a KDE colour scheme |
@@ -87,6 +98,36 @@ It is automatic, and you can control it. Add a letter after a playlist ID in `pl
 You can also write your own groups in `playlist_groups.txt`:
 `Autumn Vibes = chill autumn vibes, cozy autumn vibes` (names or IDs). Settings are under `[playlists]` in
 `config.ini`: `playlist_files`, `merge_similar` and `folder`.
+
+### Smart playlists and the gap report
+
+With `smart_playlists = yes` (the default), `Playlists/Smart/` also gets playlists built from your tags: one per
+genre folder, decade, language (by the alphabet of the title) and favourite artist (10+ songs).
+
+`python dl.py --gaps` (also run after each run when `gap_report = yes`) lists, for every playlist, the songs that
+are not in your library yet and why: no match found, DRM protected, blocked by YouTube, in your archive but the file is
+gone, or simply not downloaded yet. The full list is saved to `playlist-gaps.txt` in the state folder.
+
+## Genre repair
+
+Songs in the `Other` and `Unknown` folders, and songs with no genre tag, get a genre from MusicBrainz (free) or
+Last.fm (with your own free API key). The genre is written into the file and the song moves to the matching genre
+folder. Each run asks about a limited number of artists (`genre_repair_limit`) and remembers the answers, so every run
+fixes more. Every move is logged in `genre-repair-log.txt`. Preview with `python dl.py --genres --dry-run`.
+
+## Lyrics
+
+With `lyrics = yes` (off by default), after a run has finished, songs in your library without a lyrics file get one next to
+the song: `song.lrc` if the lyrics are timed (many players scroll along), otherwise `song.txt`. Sources, in order:
+[LRCLIB](https://lrclib.net) (free, timed), the `syncedlyrics` package that spotDL installs, and Genius if you add your own
+token. Songs that failed to download get nothing, because lyrics are fetched last. A song with no result is asked again after 30
+days.
+
+## Scheduled runs
+
+`python dl.py --schedule daily` (or `weekly`) sets up a run at 03:00: a systemd user timer on Linux (cron if there is none),
+launchd on macOS, Task Scheduler on Windows. `--schedule status` shows it and `python dl.py --unschedule` removes it. Nothing
+is scheduled unless you ask.
 
 ## SoundCloud upgrade
 
@@ -129,6 +170,8 @@ A replaced file gets fresh tags from spotDL.
 | `[updates]` | Automatic daily update of spotDL and yt-dlp |
 | `[sorting]` | Sort into genre folders after downloading |
 | `[playlists]` | Playlist files: on or off, combining similar playlists, folder |
+| `[genres]` | Genre repair, how many artists per run, optional Last.fm key |
+| `[lyrics]` | Lyrics on or off, sources, limit |
 | `[dedupe]` | Preview at the end, fingerprints, cleanup, tag merge, library report |
 | `[display]` | Colours and theme |
 
@@ -175,6 +218,12 @@ private folder, so there is no `requirements.txt` to manage.
 Their licences are their own. `dl.py` is GPL-2.0 and works with all of the above.
 
 This project is not affiliated with or endorsed by Spotify, YouTube, SoundCloud or any of the projects above.
+
+## Tests
+
+`python -m unittest discover -s tests -v` runs the tests. They check the logic (playlist flags and merging, duplicate
+detection, genre picking, smart playlists, gap reasons, lyrics, scheduler files, colours) without any network access. GitHub
+Actions runs them on Linux, Windows and macOS with Python 3.10, 3.12 and 3.14 for every push.
 
 ## Responsible use
 
