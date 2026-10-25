@@ -1066,6 +1066,21 @@ def main():
             ctypes.windll.kernel32.SetThreadExecutionState(0x80000001)
         except Exception:
             pass
+    else:                                        # macOS / Linux: no suspend while we run
+        _pid = str(os.getpid())
+        if shutil.which("caffeinate"):
+            _cmd = ["caffeinate", "-i", "-w", _pid]
+        elif shutil.which("systemd-inhibit") and shutil.which("tail"):
+            _cmd = ["systemd-inhibit", "--what=sleep:idle", "--who=dl.py",
+                    "--why=Downloading playlists", "tail", f"--pid={_pid}", "-f", "/dev/null"]
+        else:
+            _cmd = None
+        if _cmd:                                 # each one ends by itself when this script exits
+            try:
+                subprocess.Popen(_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except OSError:
+                pass
 
     def say(msg):
         line = f"[{datetime.now():%H:%M}] {msg}"
@@ -1139,7 +1154,8 @@ def main():
         if not cookies.is_file():
             say(f"WARNING: cookies file not found: {cookies}. Continuing without it.")
             cookies = None
-        elif "Netscape" not in cookies.read_text(encoding="utf-8", errors="replace")[:200]:
+        elif not any(h in cookies.read_text(encoding="utf-8", errors="replace")[:200]
+                     for h in ("Netscape", "HTTP Cookie File")):
             say("WARNING: cookies file is not in Netscape format (first line must be "
                 "'# Netscape HTTP Cookie File'). Export it again. Continuing without it.")
             cookies = None
