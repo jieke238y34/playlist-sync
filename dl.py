@@ -65,6 +65,7 @@ OPTIONAL
 import configparser
 import hashlib
 import json
+import locale
 import math
 import os
 import platform
@@ -1218,11 +1219,40 @@ def test_download(py, js, ffmpeg, cookies=None):
 
 
 def _fmt_secs(sec):
+    "A length of time for people: minutes, hours, days, and weeks only from 14 days on."
     m = int(sec) // 60
     h, m = divmod(m, 60)
+    days = h // 24
+    if days >= 730:
+        return "over 2 years"
+    if days >= 14:
+        weeks, rest = divmod(days, 7)
+        return f"{weeks} weeks {rest} days" if rest else f"{weeks} weeks"
     if h >= 48:
-        return f"{h // 24} days {h % 24} h"
+        return f"{days} days {h % 24} h"
     return f"{h} h {m} min" if h else (f"{m} min" if m else "under 1 min")
+
+
+def local_when(end, now=None):
+    """A finish time in the user's own style: day and month names in the system language, 12 or 24 hour clock as
+    the system does it, the time zone name, the date only when it is not today, the year only when it is not this year."""
+    now = now or datetime.now()
+    try:
+        locale.setlocale(locale.LC_TIME, "")                     # the system's language and format
+    except locale.Error:
+        pass
+    twelve = "15" not in datetime(2000, 1, 1, 15, 0).strftime("%X")
+    clock = end.strftime("%I:%M %p").lstrip("0") if twelve else end.strftime("%H:%M")
+    sample = datetime(2000, 11, 23).strftime("%x")                 # 11/23/2000 in the US, 23/11/2000 in the UK...
+    month_first = 0 <= sample.find("11") < sample.find("23")
+    date = ""
+    if end.date() != now.date():
+        date = end.strftime("%a %b %d" if month_first else "%a %d %b") + (end.strftime(" %Y") if end.year != now.year else "")
+    try:
+        tz = end.astimezone().strftime("%Z")                      # a plain datetime counts as local time
+    except (OSError, ValueError, OverflowError):
+        tz = ""
+    return " ".join(x for x in (date, clock, tz) if x)
 
 
 class Eta:
@@ -1270,7 +1300,8 @@ class Eta:
         return None
 
     def text(self):
-        per = sum(self.rates) / len(self.rates) if self.rates else 45.0
+        ordered = sorted(self.rates)                             # the middle value: one stall cannot ruin it
+        per = min(600.0, max(5.0, ordered[len(ordered) // 2])) if ordered else 45.0
         cur_new = self.new if self.new is not None else (self.found or 0)
         later = self.todo[self.pos:]
         known = sorted(self.sizes[p] for p in self.todo if p in self.sizes)
@@ -1281,7 +1312,7 @@ class Eta:
         songs = max(0, cur_new - self.done) + sum(self.sizes.get(p, guess) for p in later) * ratio
         secs = songs * per + len(later) * self.pause
         end = datetime.now() + timedelta(seconds=secs)
-        when = f"{end:%H:%M}" if end.date() == datetime.now().date() else f"{end:%a %d %b %H:%M}"
+        when = local_when(end)
         guessed = f" | {unread} playlists not read yet (guessed)" if unread else ""
         return (f"ETA about {_fmt_secs(secs)} left in this pass (done around {when}) | playlist "
                 f"{self.pos}/{len(self.todo)} | {self.done} of {cur_new} new songs | ~{per:.0f} s/song (rough){guessed}")

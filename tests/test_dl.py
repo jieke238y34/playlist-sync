@@ -264,13 +264,44 @@ class Display(unittest.TestCase):
         self.assertEqual(dl._fmt_secs(30), "under 1 min")
         self.assertEqual(dl._fmt_secs(3600 * 5 + 120), "5 h 2 min")
         self.assertEqual(dl._fmt_secs(3600 * 60), "2 days 12 h")
+        self.assertEqual(dl._fmt_secs(86400 * 13 + 3600 * 5), "13 days 5 h")      # under 14 days: days
+        self.assertEqual(dl._fmt_secs(86400 * 14), "2 weeks")
+        self.assertEqual(dl._fmt_secs(86400 * 45), "6 weeks 3 days")
+        self.assertEqual(dl._fmt_secs(86400 * 900), "over 2 years")
 
     def test_clean_name(self):
         self.assertEqual(dl._clean_name("NUL"), "_NUL")
         self.assertEqual(dl._clean_name("a/b:c"), "abc")
 
 
+class LocalWhen(unittest.TestCase):
+    def test_today_has_no_date(self):
+        from datetime import datetime
+        now = datetime(2026, 10, 25, 12, 0)
+        self.assertNotIn("Oct", dl.local_when(datetime(2026, 10, 25, 23, 30), now))
+        self.assertRegex(dl.local_when(datetime(2026, 10, 25, 23, 30), now), r"(23:30|11:30)")
+
+    def test_other_day_has_a_date_and_year_only_when_different(self):
+        from datetime import datetime
+        now = datetime(2026, 10, 25, 12, 0)
+        self.assertRegex(dl.local_when(datetime(2026, 11, 3, 14, 45), now), r"03")
+        self.assertNotIn("2026", dl.local_when(datetime(2026, 11, 3, 14, 45), now))
+        self.assertIn("2027", dl.local_when(datetime(2027, 1, 3, 14, 45), now))
+
+
 class Eta(unittest.TestCase):
+    def test_one_stall_does_not_ruin_the_estimate(self):
+        with tempfile.TemporaryDirectory() as d:
+            eta = dl.Eta(Path(d), 120)
+            eta.begin_pass(["p1", "p2"])
+            eta.begin_playlist(1, "p1")
+            eta.line("Found 100 songs in X (Playlist)")
+            eta.line("DL-PLAN 100")
+            eta.rates = [40.0] * 9 + [200000.0]                  # nine normal songs and a 55 hour stall
+            text = eta.text()
+            self.assertIn("~40 s/song", text)
+            self.assertNotIn("weeks", text)
+
     def test_unread_playlists_are_not_assumed_huge(self):
         with tempfile.TemporaryDirectory() as d:
             eta = dl.Eta(Path(d), 120)
