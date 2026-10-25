@@ -26,7 +26,7 @@ in `config.ini`. `python3 dl.py --upgrade` runs just that step for songs still w
 
 Duplicates: at the end of every run `dl.py` previews duplicate songs (same artist, title and
 length, or the same Spotify link) and moves nothing. `python3 dl.py --dedupe` moves the extra
-copies into `_Duplicates/` (nothing is deleted); `--dedupe --dry-run` previews only. The best copy
+copies into `_Duplicates/` (nothing is deleted); `--dedupe --dry-run` shows a short summary, then you type `--expand` to list the duplicates, `--dedupe` to move them or `--exit` to quit. The best copy
 stays (lossless, higher bitrate, cover art, full tags) and live/remix versions are kept. It also
 cleans empty or broken files, fills a missing genre tag on the kept copy, and `--report`
 shows library stats. Optional audio fingerprints (`fingerprint = yes` in `[dedupe]`, downloads a

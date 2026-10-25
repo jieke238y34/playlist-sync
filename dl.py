@@ -24,7 +24,8 @@ COMMANDS
     python3 dl.py --sort            sort only
     python3 dl.py --sort --dry-run  preview the sort, move nothing
     python3 dl.py --dedupe          move duplicate songs to _Duplicates (nothing is deleted)
-    python3 dl.py --dedupe --dry-run  preview the duplicates only
+    python3 dl.py --dedupe --dry-run  short summary, then type --expand (list the
+                                    duplicates), --dedupe (move them) or --exit
     python3 dl.py --report          library report (sizes, formats, weakest files)
     python3 dl.py --upgrade         SoundCloud upgrade only (songs still waiting from earlier runs)
     python3 dl.py --help            show this text
@@ -1592,7 +1593,48 @@ def library_report(recs, music_dir):
     return "\n".join(lines)
 
 
-def run_dedupe(cfg, dry_run=False, report_only=False):
+def _dd_summary(recs, music_dir):
+    "Short library summary for the screen."
+    kinds, folders = {}, {}
+    for r in recs:
+        p = Path(r["p"])
+        kinds[p.suffix.lower()] = kinds.get(p.suffix.lower(), 0) + 1
+        rel = p.relative_to(music_dir).parts
+        name = rel[0] if len(rel) > 1 else "(not sorted)"
+        folders[name] = folders.get(name, 0) + 1
+    top = sorted(folders.items(), key=lambda x: -x[1])
+    shown = ", ".join(f"{k} {v}" for k, v in top[:8]) + (f", +{len(top) - 8} more" if len(top) > 8 else "")
+    low = sum(1 for r in recs if not r["ll"] and 0 < r["kbps"] < 128)
+    return [
+        f"Library: {len(recs)} songs | {sum(r['len'] for r in recs) / 3600:.0f} hours | "
+        f"{sum(r['size'] for r in recs) / 1e9:.1f} GB",
+        "Formats: " + ", ".join(f"{k} {v}" for k, v in sorted(kinds.items(), key=lambda x: -x[1])),
+        "Folders: " + shown,
+        f"Low quality (under 128 kbps): {low} | No genre tag: {sum(1 for r in recs if not r['genre'])} | "
+        f"With Spotify link: {sum(1 for r in recs if r['url'])}",
+    ]
+
+
+def _dd_prompt(show):
+    "Ask what to do after a preview. Returns 'apply' or 'exit'. show() prints the full list."
+    while True:
+        try:
+            ans = input("Type --expand to list the duplicates, --dedupe to move them, "
+                        "--exit to quit: ").strip().lower().lstrip("-")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "exit"
+        if ans in ("expand", "e"):
+            show()
+        elif ans in ("dedupe", "depupe", "d"):
+            return "apply"
+        elif ans in ("exit", "quit", "q", ""):
+            return "exit"
+        else:
+            print("Please type --expand, --dedupe or --exit.")
+
+
+def run_dedupe(cfg, dry_run=False, report_only=False, ask=False):
     "Runs inside the private venv (it has mutagen)."
     try:
         from mutagen import File as mutagen_file
@@ -1651,15 +1693,16 @@ def run_dedupe(cfg, dry_run=False, report_only=False):
                             cache[r["p"]][2]["fp"] = fp
 
     if cfg["dd_report"] or report_only:
-        text = library_report(recs, music_dir)
-        (state / "library-report.txt").write_text(text + "\n", encoding="utf-8")
-        print("--- library report ---\n" + text + f"\n(saved to {state / 'library-report.txt'})")
+        (state / "library-report.txt").write_text(library_report(recs, music_dir) + "\n", encoding="utf-8")
+    summary = _dd_summary(recs, music_dir)
     if report_only:
+        print("\n".join(summary))
+        print(f"Saved to: {state}  (library-report.txt)")
         _dd_save_cache(cache_file, cache)
         return
 
     plan, report = [], []                        # plan: (keeper rec, [(loser rec, reason)])
-    for group in find_duplicate_groups(recs, cfg["dd_fingerprint"] and not report_only):
+    for group in find_duplicate_groups(recs, cfg["dd_fingerprint"]):
         covers = {r["p"]: _dd_has_cover(mutagen_file, Path(r["p"])) for r in group}
         ranked = sorted(group, key=lambda r: _dd_rank(r, covers[r["p"]], music_dir), reverse=True)
         best = ranked[0]
@@ -1671,37 +1714,46 @@ def run_dedupe(cfg, dry_run=False, report_only=False):
     new_files, empty_dirs = _dd_walk(music_dir) if cfg["dd_cleanup"] else ([], [])
     junk = broken + new_files if cfg["dd_cleanup"] else []
 
-    print(f"--- duplicates: {len(plan)} songs have extra copies ({moving} files) ---")
+    def short(r):
+        p = Path(r["p"])
+        return f"{p.parent.name}/{p.name}"
     for keeper, losers in plan:
         report.append(f"KEEP  {keeper['p']}  ({keeper['kbps']} kbps)")
         for r, why in losers:
             report.append(f"MOVE  {r['p']}  ({r['kbps']} kbps)  because: {why}")
         report.append("")
-    def short(r):
-        p = Path(r["p"])
-        return f"{p.parent.name}/{p.name}"
-    for keeper, losers in plan[:25]:
-        print(f"  KEEP {short(keeper)}  ({keeper['kbps']} kbps)")
-        for r, why in losers:
-            print(f"    MOVE {short(r)}  ({r['kbps']} kbps, {why})")
-    if len(plan) > 25:
-        print(f"  ... and {len(plan) - 25} more. The full list is in the report.")
-    if cfg["dd_cleanup"]:
-        print(f"--- cleanup: {len(junk)} empty, unreadable or leftover files, {len(empty_dirs)} empty folders ---")
-        for f in junk[:10]:
-            print("  ", f)
-        report += ["BROKEN/LEFTOVER " + str(f) for f in junk] + ["EMPTY FOLDER " + str(d) for d in empty_dirs]
+    report += ["BROKEN/LEFTOVER " + str(f) for f in junk] + ["EMPTY FOLDER " + str(d) for d in empty_dirs]
     (state / "dedupe-report.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
-    print(f"Full list: {state / 'dedupe-report.txt'}")
+
+    def expand():
+        for keeper, losers in plan:
+            print(f"  KEEP {short(keeper)}  ({keeper['kbps']} kbps)")
+            for r, why in losers:
+                print(f"    MOVE {short(r)}  ({r['kbps']} kbps, {why})")
+        for f in junk:
+            print(f"  BROKEN/LEFTOVER {f}")
+        for d in empty_dirs:
+            print(f"  EMPTY FOLDER {d}")
+    print("\n".join(summary))
+    print(f"Duplicates: {len(plan)} songs have extra copies ({moving} files to move)")
+    if junk or empty_dirs:
+        print(f"Cleanup: {len(junk)} empty, unreadable or leftover files | {len(empty_dirs)} empty folders")
+    print(f"Saved to: {state}  (dedupe-report.txt, library-report.txt)")
 
     if dry_run:
-        if moving or junk or empty_dirs:
-            print("Preview only, nothing was moved. To move the extra copies into "
-                  f"{DUP_DIR}/ (nothing is deleted), run:  python3 dl.py --dedupe")
-        else:
+        if not (moving or junk or empty_dirs):
             print("Nothing to clean up.")
-        _dd_save_cache(cache_file, cache)
-        return
+            _dd_save_cache(cache_file, cache)
+            return
+        if ask:
+            if _dd_prompt(expand) != "apply":
+                print("Nothing was moved.")
+                _dd_save_cache(cache_file, cache)
+                return
+        else:
+            print("Nothing was moved. To see the list and choose:  python3 dl.py --dedupe --dry-run")
+            _dd_save_cache(cache_file, cache)
+            return
 
     moved = merged = 0
     for keeper, losers in plan:
@@ -1985,14 +2037,15 @@ def main():
 
     if cfg["dd_preview"]:
         say("Checking for duplicate songs (preview only, nothing is moved)...")
-        run_inner(py, "--dedupe-inner", "--dry-run")
+        run_inner(py, "--dedupe-inner", "--dry-run", "--no-ask")
 
 
 if __name__ == "__main__":
     args = sys.argv[1:]
     try:
         known = {"-h", "--help", "--sort", "--dry-run", "--upgrade", "--dedupe", "--report",
-                 "--sort-inner", "--seed-inner", "--upgrade-inner", "--dedupe-inner", "--report-only"}
+                 "--sort-inner", "--seed-inner", "--upgrade-inner", "--dedupe-inner", "--report-only",
+                 "--no-ask"}
         if "-h" in args or "--help" in args:
             print(__doc__)
         elif set(args) - known or ("--dry-run" in args and not {"--sort", "--sort-inner", "--dedupe", "--dedupe-inner"} & set(args)):
@@ -2002,7 +2055,8 @@ if __name__ == "__main__":
             _cfg = load_config()
             sort_library(_cfg["music_dir"], _cfg["overrides_file"], "--dry-run" in args)
         elif "--dedupe-inner" in args:          # runs inside the private venv (has mutagen)
-            run_dedupe(load_config(), "--dry-run" in args, "--report-only" in args)
+            run_dedupe(load_config(), "--dry-run" in args, "--report-only" in args,
+                       ask="--no-ask" not in args and sys.stdin.isatty())
         elif "--dedupe" in args or "--report" in args:
             create_missing_files(need_playlists=False)
             _cfg = load_config()
