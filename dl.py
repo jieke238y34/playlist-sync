@@ -28,6 +28,8 @@ COMMANDS
                                     duplicates), --dedupe (move them) or --exit
     python3 dl.py --report          library report (sizes, formats, weakest files)
     python3 dl.py --colors          show the colours that are in use (KDE Plasma colours if available)
+    python3 dl.py --colors NAME     preview a KDE colour scheme that you have, active or not
+    python3 dl.py --themes          list the KDE colour schemes you can use as  theme = NAME
     python3 dl.py --upgrade         SoundCloud upgrade only (songs still waiting from earlier runs)
     python3 dl.py --help            show this text
 
@@ -171,7 +173,9 @@ def is_block(line):
 # goes to a file or NO_COLOR is set. Change the numbers below to change a colour.
 # Cyan for good and bold red for bad: easy to tell apart with most kinds of colour blindness.
 COLOR_ON = False
+ACTIVE_THEME = "auto"
 PALETTE = {"ok": "36", "err": "1;31", "warn": "33", "bold": "1", "dim": "2"}
+DEFAULT_PALETTE = dict(PALETTE)
 
 
 def _lum(c):
@@ -196,18 +200,15 @@ def _readable(c, bg, want=4.5):
     return c
 
 
-def kde_palette():
-    "Colours of the KDE Plasma colour scheme, adjusted to read well. None if not on Plasma + true colour."
-    if os.name == "nt" or sys.platform == "darwin":
-        return None
-    if "KDE" not in os.environ.get("XDG_CURRENT_DESKTOP", "").upper():
-        return None
-    if os.environ.get("COLORTERM", "").lower() not in ("truecolor", "24bit"):
-        return None
+def _truecolor():
+    return os.environ.get("COLORTERM", "").lower() in ("truecolor", "24bit") or bool(os.environ.get("WT_SESSION"))
+
+
+def _read_scheme(path):
+    "The [Colors:View] colours of a KDE colour scheme file as {name: (r, g, b)}, or None."
     try:
-        path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "kdeglobals"
         got, sec = {}, ""
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
             if line.startswith("[") and line.endswith("]"):
                 sec = line[1:-1]
@@ -216,8 +217,60 @@ def kde_palette():
                 parts = v.split(",")
                 if len(parts) == 3:
                     got[k] = tuple(max(0, min(255, int(x))) for x in parts)
-        bg = got["BackgroundNormal"]
-    except (OSError, KeyError, ValueError):
+        return got or None
+    except (OSError, ValueError):
+        return None
+
+
+def _scheme_dirs():
+    data = [Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")]
+    data += [Path(d) for d in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":") if d]
+    return [d / "color-schemes" for d in data]
+
+
+def installed_schemes():
+    "{name: path} of the KDE colour schemes on this computer."
+    found = {}
+    for d in _scheme_dirs():
+        try:
+            for f in sorted(d.glob("*.colors")):
+                found.setdefault(f.stem, f)
+        except OSError:
+            pass
+    return found
+
+
+def _find_scheme(name):
+    "Path of an installed KDE colour scheme (by name), or of a .colors file given as a path."
+    p = Path(os.path.expanduser(name))
+    if p.suffix == ".colors" and p.is_file():
+        return p
+    want = name.lower().replace(" ", "")
+    for stem, f in installed_schemes().items():
+        if stem.lower().replace(" ", "") == want:
+            return f
+    return None
+
+
+def kde_palette(scheme=None):
+    """Colours of a KDE colour scheme, adjusted to read well. None if not possible.
+    scheme=None: the Plasma scheme that is active now (only on Plasma). Or the name of any
+    installed scheme (or the path of a .colors file), active or not."""
+    if not _truecolor():
+        return None
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    current = _read_scheme(config / "kdeglobals")
+    if scheme:
+        f = _find_scheme(scheme)
+        got = _read_scheme(f) if f else None
+    elif os.name == "nt" or sys.platform == "darwin" or "KDE" not in os.environ.get("XDG_CURRENT_DESKTOP", "").upper():
+        return None
+    else:
+        got = current
+    if not got:
+        return None
+    bg = (current or got).get("BackgroundNormal") or got.get("BackgroundNormal")   # your real terminal background
+    if not bg:
         return None
 
     def pick(*names):
@@ -235,16 +288,30 @@ def kde_palette():
     ok, err, warn, dim, norm = (_readable(c, bg) for c in (ok, err, warn, dim, norm))
     code = lambda c: f"38;2;{c[0]};{c[1]};{c[2]}"
     pal = {"ok": code(ok), "err": "1;" + code(err), "dim": code(dim), "bold": "1;" + code(norm)}
-    far = lambda a, b: sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5 > 90
-    if far(warn, ok) and far(warn, err):               # keep warnings apart from the other two
+    far = lambda a, b, n: sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5 > n
+    if far(warn, ok, 60) and far(warn, err, 45):       # keep warnings apart from the other two
         pal["warn"] = code(warn)
     return pal
 
 
-def show_colors():
-    "dl.py --colors: print the colours that are in use."
-    kde = kde_palette()
-    print("Colour theme:", "KDE Plasma (from ~/.config/kdeglobals)" if kde and COLOR_ON else "standard terminal colours")
+def show_colors(scheme=None):
+    "dl.py --colors [NAME]: print the colours in use, or how a scheme would look."
+    if scheme:
+        pal = kde_palette(scheme)
+        if pal is None:
+            print(f"Colour theme '{scheme}' was not found (or this terminal has no true colour). "
+                  "See the list with:  dl.py --themes")
+        PALETTE.update(DEFAULT_PALETTE)
+        PALETTE.update(pal or {})
+        title = f"Preview of the colour scheme '{scheme}'" if pal else "standard terminal colours"
+    else:
+        if PALETTE == DEFAULT_PALETTE:
+            title = "standard terminal colours"
+        elif ACTIVE_THEME.lower() == "auto":
+            title = "your active KDE Plasma colour scheme"
+        else:
+            title = f"colour scheme '{ACTIVE_THEME}' (from config.ini)"
+    print("Colour theme:", title)
     for kind, text in (("ok", "Downloaded / KEEP / good news"), ("warn", "WARNING / MOVE / careful"),
                        ("err", "ERROR / failed / problem"), ("dim", "Skipped / waiting / low importance"),
                        ("bold", "Headings and labels")):
@@ -253,9 +320,22 @@ def show_colors():
         print("(Colours are off here: no terminal, NO_COLOR is set, or color = no.)")
 
 
-def init_color(mode, theme="auto"):
+def show_themes():
+    "dl.py --themes: the KDE colour schemes that can be used as  theme = NAME."
+    names = installed_schemes()
+    if not names:
+        print("No KDE colour schemes found in ~/.local/share/color-schemes or /usr/share/color-schemes.")
+        print("You can also set  theme = /full/path/to/Scheme.colors")
+        return
+    print(f"{len(names)} colour schemes found. Use one in config.ini as  theme = NAME  "
+          "(preview: dl.py --colors NAME):")
+    print("  " + ", ".join(names))
+
+
+def init_color(mode, theme="auto", quiet=False):
     "Switch colours on or off for this process. On Windows this also enables ANSI codes."
-    global COLOR_ON
+    global COLOR_ON, ACTIVE_THEME
+    ACTIVE_THEME = theme
     mode = (mode or "auto").lower()
     if mode == "no" or os.environ.get("NO_COLOR") is not None and mode != "yes":
         COLOR_ON = False
@@ -276,8 +356,16 @@ def init_color(mode, theme="auto"):
             COLOR_ON = False
             return
     COLOR_ON = True
-    if theme != "ansi":
+    if theme.lower() == "ansi":
+        return
+    if theme.lower() == "auto":
         PALETTE.update(kde_palette() or {})
+    else:                                        # the name of any installed colour scheme, active or not
+        pal = kde_palette(theme)
+        if pal is None and not quiet:
+            print(f"NOTE: colour theme '{theme}' was not found, or this terminal has no true colour. "
+                  "Using standard colours. List the themes with:  dl.py --themes")
+        PALETTE.update(pal or {})
 
 
 def paint(text, kind):
@@ -656,10 +744,15 @@ sort_after_download = yes
 # yes = always. no = never. Default: auto
 color = auto
 
-# Which colours to use. auto = copy your KDE Plasma colour scheme when running on Plasma in a
-# true-colour terminal (Konsole, Kitty...), otherwise the standard terminal colours.
-# The scheme colours are brightened where needed so they stay easy to read.
-# ansi = always the standard terminal colours. Check what you get with:  dl.py --colors
+# Which colours to use.
+#   auto = copy the KDE Plasma colour scheme that is active now (only on Plasma, in a true-colour
+#          terminal such as Konsole or Kitty). Otherwise the standard terminal colours.
+#   NAME = copy ANY KDE colour scheme you have installed, even if it is not the active one.
+#          Example:  theme = CatppuccinMocha     (a .colors file in ~/.local/share/color-schemes)
+#          Or a full path:  theme = /home/me/Downloads/Scheme.colors
+#          See the choices:  dl.py --themes     Preview one:  dl.py --colors NAME
+#   ansi = always the standard terminal colours.
+# Scheme colours are brightened where needed so they stay easy to read on your background.
 theme = auto
 
 [dedupe]
@@ -815,7 +908,7 @@ def load_config():
         "prefer_sc": yes_no("prefer_soundcloud", True, "sources"),
         "auto_update": yes_no("auto_update", True, "updates"),
         "color": cp.get("display", "color", fallback="auto").strip().lower() or "auto",
-        "theme": cp.get("display", "theme", fallback="auto").strip().lower() or "auto",
+        "theme": cp.get("display", "theme", fallback="auto").strip().strip("\"'") or "auto",
         "dd_preview": yes_no("preview_at_end", True, "dedupe"),
         "dd_fingerprint": yes_no("fingerprint", False, "dedupe"),
         "dd_cleanup": yes_no("cleanup", True, "dedupe"),
@@ -2224,20 +2317,24 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     try:
         _c = load_config()
-        init_color(_c["color"], _c["theme"])
+        init_color(_c["color"], _c["theme"], quiet=any(a.endswith("-inner") for a in args))
+        rest = [a for i, a in enumerate(args) if not (i and args[i - 1] == "--colors" and not a.startswith("-"))]
         known = {"-h", "--help", "--sort", "--dry-run", "--upgrade", "--dedupe", "--report",
                  "--sort-inner", "--seed-inner", "--upgrade-inner", "--dedupe-inner", "--report-only",
-                 "--no-ask", "--colors"}
+                 "--no-ask", "--colors", "--themes"}
         if "-h" in args or "--help" in args:
             print(__doc__)
-        elif set(args) - known or ("--dry-run" in args and not {"--sort", "--sort-inner", "--dedupe", "--dedupe-inner"} & set(args)):
-            sys.exit("Usage: dl.py [--sort | --dedupe [--dry-run]] [--report] [--upgrade] [--colors] [--help]\n"
+        elif set(rest) - known or ("--dry-run" in args and not {"--sort", "--sort-inner", "--dedupe", "--dedupe-inner"} & set(args)):
+            sys.exit("Usage: dl.py [--sort | --dedupe [--dry-run]] [--report] [--upgrade] [--colors [NAME]] [--themes] [--help]\n"
                      "(unknown option, or --dry-run used without --sort)")
         elif "--sort-inner" in args:            # runs inside the private venv (has mutagen)
             _cfg = load_config()
             sort_library(_cfg["music_dir"], _cfg["overrides_file"], "--dry-run" in args)
-        elif "--colors" in args:                # show the colours in use
-            show_colors()
+        elif "--themes" in args:                # list the colour schemes
+            show_themes()
+        elif "--colors" in args:                # show the colours in use, or preview a scheme
+            i = args.index("--colors")
+            show_colors(args[i + 1] if i + 1 < len(args) and not args[i + 1].startswith("-") else None)
         elif "--dedupe-inner" in args:          # runs inside the private venv (has mutagen)
             run_dedupe(load_config(), "--dry-run" in args, "--report-only" in args,
                        ask="--no-ask" not in args and sys.stdin.isatty())

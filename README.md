@@ -34,7 +34,9 @@ small helper on Windows, Linux and macOS) find copies whose names differ.
 
 Output is coloured in a terminal. On KDE Plasma with a true-colour terminal it copies your Plasma colour
 scheme (brightened where needed so it stays readable); elsewhere it uses cyan = good, yellow = warning,
-bold red = problem. `python3 dl.py --colors` shows what is in use. Log files stay plain. Set `color = no` or `theme = ansi` under `[display]` in `config.ini` to turn it off, or use the `NO_COLOR` setting.
+bold red = problem. `python3 dl.py --colors` shows what is in use. To copy a different KDE colour scheme that you have
+installed (it does not need to be active), run `python3 dl.py --themes`, preview with `--colors NAME` and set
+`theme = NAME` under `[display]`. Log files stay plain. Set `color = no` or `theme = ansi` under `[display]` in `config.ini` to turn it off, or use the `NO_COLOR` setting.
 
 Optional: node (fewer YouTube errors) and a cookies file (age-restricted songs).
 
