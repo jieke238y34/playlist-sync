@@ -38,11 +38,36 @@ IDs starting `37i9dQZF`) do not work: copy their songs into your own public play
 | `python3 dl.py --sort` | Sort only. Add `--dry-run` to preview. |
 | `python3 dl.py --dedupe --dry-run` | Short summary, then type `--expand` to list the duplicates, `--dedupe` to move them, or `--exit` |
 | `python3 dl.py --dedupe` | Move duplicate songs to `_Duplicates/` straight away (nothing is deleted) |
+| `python3 dl.py --playlists` | Build the playlist files now. Add `--dry-run` to see what would be combined. |
 | `python3 dl.py --report` | Library report: songs, hours, size, formats, folders, weakest files |
 | `python3 dl.py --upgrade` | Run only the SoundCloud upgrade step for songs still waiting |
 | `python3 dl.py --colors [NAME]` | Show the colours in use, or preview a KDE colour scheme |
 | `python3 dl.py --themes` | List the KDE colour schemes you can use |
 | `python3 dl.py --help` | Show the built-in help |
+
+## Playlist files
+
+Every playlist also gets a standard `.m3u8` playlist file in `<music folder>/Playlists/`, so any music
+player can play it. Each song is linked by its Spotify link, so the links stay right when songs are sorted
+into genre folders, upgraded from SoundCloud or moved by the duplicate cleanup. The files are rebuilt after
+every run. Songs that are not in your library yet are skipped and linked on a later run.
+
+Playlists with similar names are **combined**: "chill autumn vibes" and "cozy autumn vibes" become one
+`Autumn Vibes.m3u8`, and a song that is in both is listed once. Check what would be combined with
+`python3 dl.py --playlists --dry-run`.
+
+It is automatic, and you can control it. Add a letter after a playlist ID in `playlists.txt`:
+
+| After the ID | Meaning |
+|---|---|
+| `X` | no playlist file for this one |
+| `S` | its own file, never combined |
+| `P` | make a file (only needed if `playlist_files = no`) |
+| `P=Road Trip` | put it in the group "Road Trip" (any of `P`, `S`, `X` or nothing before the `=`) |
+
+You can also write your own groups in `playlist_groups.txt`:
+`Autumn Vibes = chill autumn vibes, cozy autumn vibes` (names or IDs). Settings are under `[playlists]` in
+`config.ini`: `playlist_files`, `merge_similar` and `folder`.
 
 ## SoundCloud upgrade
 
@@ -84,11 +109,12 @@ A replaced file gets fresh tags from spotDL.
 | `[sources]` | `audio_sources` order and `prefer_soundcloud` |
 | `[updates]` | Automatic daily update of spotDL and yt-dlp |
 | `[sorting]` | Sort into genre folders after downloading |
+| `[playlists]` | Playlist files: on or off, combining similar playlists, folder |
 | `[dedupe]` | Preview at the end, fingerprints, cleanup, tag merge, library report |
 | `[display]` | Colours and theme |
 
 Every setting is explained in the file itself. `config.ini`, `playlists.txt` and
-`genre_overrides.txt` are personal: they are in `.gitignore` and are not part of this repository.
+`genre_overrides.txt` (and `playlist_groups.txt`) are personal: they are in `.gitignore` and are not part of this repository.
 
 ## Colours
 

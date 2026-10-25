@@ -26,6 +26,7 @@ COMMANDS
     python3 dl.py --dedupe          move duplicate songs to _Duplicates (nothing is deleted)
     python3 dl.py --dedupe --dry-run  short summary, then type --expand (list the
                                     duplicates), --dedupe (move them) or --exit
+    python3 dl.py --playlists       build the playlist files (.m3u8). Add --dry-run to see what is combined.
     python3 dl.py --report          library report (sizes, formats, weakest files)
     python3 dl.py --colors          show the colours that are in use (KDE Plasma colours if available)
     python3 dl.py --colors NAME     preview a KDE colour scheme that you have, active or not
@@ -381,7 +382,7 @@ def paint(text, kind):
 
 _OK_START = ("Downloaded ", "Upgraded", "SoundCloud upgrade finished", "Moved ", "All passes finished",
              "Created ", "No failed songs", "Nothing to clean up")
-_DIM_START = ("ETA", "Skipped", "Skipping", "Found ", "Processing query", "Waiting ", "Saved ", "Checking ",
+_DIM_START = ("ETA", "Playlist files", "Skipped", "Skipping", "Found ", "Processing query", "Waiting ", "Saved ", "Checking ",
               "Library check", "Nothing was moved")
 _WARN_START = ("SoundCloud failed", "No close match", "Kept the YouTube", "NOTE", "Note:", "Fallback")
 
@@ -666,6 +667,12 @@ music_dir =
 # Text file with your playlist IDs. Default: playlists.txt next to dl.py
 playlists_file =
 
+# OPTIONAL - text file with your own playlist groups, one per line:
+#   Autumn Vibes = chill autumn vibes, cozy autumn vibes
+# (the names are the playlists' Spotify names, or their IDs). Default: playlist_groups.txt
+# next to dl.py. The file does not need to exist.
+playlist_groups_file =
+
 # Folder for logs and error lists. Default: <home>/.dl-music
 state_dir =
 
@@ -744,6 +751,24 @@ auto_update = yes
 # To sort without downloading:  dl.py --sort
 # To preview without moving:    dl.py --sort --dry-run
 sort_after_download = yes
+
+[playlists]
+# Playlist files: one .m3u8 file per playlist, linking every song that is in your library, so
+# any music player can play the playlist. They are rebuilt after every run (after sorting and
+# after moving duplicates), so the links always point to where each song is now.
+# yes = every playlist gets a file, unless you put X after its ID in playlists.txt.
+# no  = only playlists that have P after the ID get a file.
+playlist_files = yes
+
+# yes = playlists with similar names are combined into one file: "chill autumn vibes" and
+# "cozy autumn vibes" become "Autumn Vibes". A song that is in both is listed once.
+# Check what would be combined first:  dl.py --playlists --dry-run
+# Control it yourself: S after an ID = never combine it, =Group name after an ID = put it in that
+# group, or write your own groups in playlist_groups.txt (see [paths]).
+merge_similar = yes
+
+# Folder for the playlist files, inside your music folder. A full path also works.
+folder = Playlists
 
 [display]
 # Coloured text on screen (cyan = good, yellow = warning, bold red = problem).
@@ -830,6 +855,18 @@ PLAYLISTS_TEMPLATE = """\
 #   - Duplicates are ignored. Bad lines are skipped with a message.
 #   - You can add a note after a link, behind a #. Example:
 #       1r9DRLBzZqkPU0aDBVycY8   # road trip mix
+#
+# PLAYLIST FILES (OPTIONAL CONTROLS)
+#   Every playlist also gets a playlist file (.m3u8) in your music folder, linking its songs, and
+#   playlists with similar names are combined ("chill autumn vibes" + "cozy autumn vibes" =
+#   "Autumn Vibes"). You do not have to do anything. To control it, add a letter after the ID:
+#       1r9DRLBzZqkPU0aDBVycY8 X                no playlist file for this one
+#       1r9DRLBzZqkPU0aDBVycY8 S                its own file, never combined
+#       1r9DRLBzZqkPU0aDBVycY8 P                make a file (needed if playlist_files = no)
+#       1r9DRLBzZqkPU0aDBVycY8 P=Road Trip      put it in the group "Road Trip"
+#   The letter can also touch the ID: 1r9DRLBzZqkPU0aDBVycY8X. A 22 character ID is always
+#   complete, so an ID that happens to end in P or X is safe.
+#   See what would be combined, without writing anything:  python3 dl.py --playlists --dry-run
 #
 # GOOD TO KNOW
 #   - Playlists download from top to bottom. Put the ones you want first at the top.
@@ -920,6 +957,10 @@ def load_config():
         "auto_update": yes_no("auto_update", True, "updates"),
         "color": cp.get("display", "color", fallback="auto").strip().lower() or "auto",
         "theme": cp.get("display", "theme", fallback="auto").strip().strip("\"'") or "default",
+        "pl_files": yes_no("playlist_files", True, "playlists"),
+        "pl_merge": yes_no("merge_similar", True, "playlists"),
+        "pl_folder": cp.get("playlists", "folder", fallback="Playlists").strip().strip("\"'") or "Playlists",
+        "groups_file": path("playlist_groups_file", HERE / "playlist_groups.txt"),
         "dd_preview": yes_no("preview_at_end", True, "dedupe"),
         "dd_fingerprint": yes_no("fingerprint", False, "dedupe"),
         "dd_cleanup": yes_no("cleanup", True, "dedupe"),
@@ -953,9 +994,15 @@ def create_missing_files(need_playlists=True):
         sys.exit(0)
 
 
-def load_ids(path):
+def load_ids(path, flags=None):
     """Read playlist IDs. Accepts bare IDs, full links, spotify: URIs.
-    Strips quotes, commas, spaces and ?si=... Skips bad lines. Removes duplicates."""
+    Strips quotes, commas, spaces and ?si=... Skips bad lines. Removes duplicates.
+    After the ID you can add a playlist-file flag: P (make a playlist file), X (do not),
+    S (make one, never merged) and =Group name (put it in that group). Examples:
+        1r9DRLBzZqkPU0aDBVycY8 X        1r9DRLBzZqkPU0aDBVycY8P        link S
+        1r9DRLBzZqkPU0aDBVycY8 P=Autumn Vibes
+    A 22 character ID is always complete. A 23rd character P, S or X is the flag.
+    flags (a dict, if given) gets  id -> (flag or "", group name or "")."""
     ids, seen = [], set()
     for n, raw in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
         line = raw.split("#", 1)[0].strip()
@@ -963,9 +1010,16 @@ def load_ids(path):
             continue
         m = LINK_ID_RE.search(line)
         if m:
-            pid = m.group(1)
+            pid, rest = m.group(1), line[m.end():]
         else:
-            pid = re.split(r"[?\s,;]", line.strip("\"'` ,;"))[0]
+            cleaned = line.strip("\"'` ,;")
+            pid = re.split(r"[?\s,;=]", cleaned)[0]
+            rest = cleaned[len(pid):]
+            if len(pid) == 23 and pid[-1].upper() in "PSX" and ID_RE.fullmatch(pid[:22]):
+                pid, rest = pid[:22], pid[22:] + " " + rest
+        rest = re.sub(r"^\?\S*", "", rest.strip(" ,;")).strip(" ,;")
+        fm = re.match(r"^([PSXpsx])?\s*(?:=\s*(.+))?$", rest)
+        flag, group = (fm.group(1) or "").upper(), (fm.group(2) or "").strip() if fm else ("", "")
         where = f"{path.name} line {n}"
         if pid.startswith("37i9dQZF"):
             print(f"SKIPPED {where}: Spotify-made playlists do not work ({pid})")
@@ -974,6 +1028,10 @@ def load_ids(path):
         elif pid not in seen:
             seen.add(pid)
             ids.append(pid)
+            if flags is not None:
+                flags[pid] = (flag, group)
+        elif flags is not None and flag == "P" and flags.get(pid, ("", ""))[0] != "P":
+            flags[pid] = (flag, group or flags[pid][1])           # the same ID twice: P wins
     return ids
 
 
@@ -2137,6 +2195,8 @@ def run_dedupe(cfg, dry_run=False, report_only=False, ask=False):
     _dd_save_cache(cache_file, cache)
     cprint(f"Moved {moved} duplicate files and {len(junk)} broken/leftover files to {music_dir / DUP_DIR}. "
            f"Filled {merged} missing tags on kept copies. Delete {DUP_DIR} when you are happy.")
+    if moved and (state / "playlist-cache.json").is_file():    # keep the playlist links right
+        build_playlists(cfg, refresh=False)
 
 
 def _dd_save_cache(path, cache):
@@ -2147,6 +2207,325 @@ def _dd_save_cache(path, cache):
         os.replace(part, path)
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------
+# PLAYLIST FILES
+# One .m3u8 file per playlist (or per group of similar playlists) in <music_dir>/Playlists. Every
+# song that is in your library is linked by its Spotify link, so the links stay right after sorting,
+# upgrading and moving duplicates. Built by:  dl.py --playlists   (also at the end of every run)
+PL_GENERIC = frozenset(
+    "the a an of to for and in on my your our playlist playlists songs song music mix hits best good "
+    "great amazing ultimate perfect peak top chill cozy calm relaxing".split())
+PL_SOFT = frozenset("vibes mood season aesthetic edition collection essentials".split())
+
+
+def _pl_core(name):
+    "The meaningful words of a playlist name: no decoration, no filler like 'chill' or 'songs'."
+    return tuple(w for w in re.findall(r"[^\W_]+", name.lower()) if w not in PL_GENERIC)
+
+
+def _pl_similar(a, b):
+    "True if two playlist names are about the same thing (same core words, or one only adds 'vibes'...)."
+    ca, cb = set(_pl_core(a)), set(_pl_core(b))
+    if not ca or not cb:
+        return False
+    if ca == cb:
+        return True
+    small, big = (ca, cb) if len(ca) < len(cb) else (cb, ca)
+    return small < big and (big - small) <= PL_SOFT
+
+
+def _pl_title(names):
+    "A name for a group: the longest run of words that all the playlist names share, e.g. Autumn Vibes."
+    seqs = [re.findall(r"[^\W_]+(?:['’][^\W_]+)*", n.lower()) for n in names]
+    first, best = seqs[0], []
+    for i in range(len(first)):
+        for j in range(len(first), i + len(best), -1):
+            run = first[i:j]
+            if all(any(sq[k:k + len(run)] == run for k in range(len(sq) - len(run) + 1)) for sq in seqs[1:]):
+                best = run
+                break
+    if not any(w not in PL_GENERIC for w in best):         # only filler words in common: use the core words
+        best = list(max((_pl_core(n) for n in names), key=len)) or best
+    return " ".join(w[:1].upper() + w[1:] for w in best) if best else names[0]
+
+
+def _pl_groups_file(path):
+    "{group name: [playlist names or IDs]} from the optional playlist_groups.txt."
+    out = {}
+    try:
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if "=" in line:
+                name, members = line.split("=", 1)
+                if name.strip():
+                    out[name.strip()] = [m.strip() for m in members.split(",") if m.strip()]
+    except OSError:
+        pass
+    return out
+
+
+def plan_playlists(cfg, meta, ids, flags):
+    """Decide which playlists get a file and which are combined. meta: {id: {"name": ...}}.
+    Returns (files, skipped): files = {file name: [ids]} in playlists.txt order."""
+    named = _pl_groups_file(cfg["groups_file"])
+    by_member = {}
+    for group, members in named.items():
+        for mem in members:
+            by_member[mem.lower()] = group
+    chosen = {}                                   # id -> explicit group name or ""
+    solo, skipped = set(), []
+    for pid in ids:
+        flag, group = flags.get(pid, ("", ""))
+        if pid not in meta:
+            continue
+        if flag == "X" or (not flag and not cfg["pl_files"]):
+            skipped.append(pid)
+            continue
+        name = meta[pid]["name"]
+        if flag == "S":
+            solo.add(pid)
+        group = group or by_member.get(pid.lower()) or by_member.get(name.lower()) or ""
+        chosen[pid] = group
+    todo = [p for p in ids if p in chosen]
+    parent = {p: p for p in todo}
+
+    def find(p):
+        while parent[p] != p:
+            parent[p] = parent[parent[p]]
+            p = parent[p]
+        return p
+    if cfg["pl_merge"]:
+        auto = [p for p in todo if not chosen[p] and p not in solo]
+        for n, p in enumerate(auto):
+            for q in auto[n + 1:]:
+                if _pl_similar(meta[p]["name"], meta[q]["name"]):
+                    parent[find(q)] = find(p)
+    clusters = {}
+    for p in todo:
+        if chosen[p]:
+            key = ("group", chosen[p].lower())
+        elif p in solo or not cfg["pl_merge"]:
+            key = ("one", p)
+        else:
+            key = ("auto", find(p))
+        clusters.setdefault(key, []).append(p)
+    files, used = {}, {}
+    for key, members in clusters.items():
+        names = [meta[p]["name"] for p in members]
+        if key[0] == "group":
+            title = next(g for p in members for g in [chosen[p]] if g)
+        elif key[0] == "auto" and len(members) > 1:
+            title = _pl_title(names)
+        else:
+            title = names[0]
+        fname = _clean_name(title) if re.search(r"[^\W_]", title) else members[0]
+        if fname.lower() in used and used[fname.lower()] != key:      # two different playlists, same name
+            fname = f"{fname} ({members[0][:6]})"
+        used[fname.lower()] = key
+        files[fname] = members
+    return files, skipped
+
+
+def _pl_client():
+    from spotdl.utils.config import DEFAULT_CONFIG
+    from spotdl.utils.spotify import SpotifyClient
+    try:
+        SpotifyClient.init(client_id=DEFAULT_CONFIG["client_id"], client_secret=DEFAULT_CONFIG["client_secret"],
+                           user_auth=False, headless=True)
+    except Exception:
+        pass                                      # already started
+
+
+def _pl_fetch(pid):
+    "{'name':..., 'tracks': [[link, title, artist, seconds], ...]} for a public playlist."
+    import contextlib
+    import io
+    from spotdl.types.playlist import Playlist
+    with contextlib.redirect_stdout(io.StringIO()):
+        meta, songs = Playlist.get_metadata("https://open.spotify.com/playlist/" + pid)
+    return {"name": meta.get("name") or pid,
+            "tracks": [[x.url, x.name, x.artist, x.duration or 0] for x in songs]}
+
+
+def _pl_library(music_dir, state, mutagen_file):
+    "Facts about every song file in the library, including _Duplicates (shares the dedupe cache)."
+    cache_file = state / "dedupe-cache.json"
+    try:
+        raw = json.loads(cache_file.read_text(encoding="utf-8"))
+        cache = raw["files"] if raw.get("v") == 2 else {}
+    except (OSError, ValueError, KeyError, AttributeError):
+        cache = {}
+    recs = []
+    for f in audio_files(music_dir):
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        hit = cache.get(str(f))
+        if hit and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+            r = hit[2]
+        else:
+            r = _dd_probe(mutagen_file, f)
+            if r is False:
+                continue
+            if r is not None:
+                r["fp"] = None
+            cache[str(f)] = [st.st_mtime_ns, st.st_size, r]
+        if r:
+            r = dict(r)
+            r["p"], r["name"] = str(f), f.stem
+            r["dup"] = DUP_DIR in f.relative_to(music_dir).parts
+            recs.append(r)
+    _dd_save_cache(cache_file, cache)
+    return recs
+
+
+class _PlLinker:
+    "Finds the library file for a Spotify track."
+
+    def __init__(self, recs):
+        self.by_url, self.dup_url, self.by_key = {}, {}, {}
+        for r in recs:
+            title = r["title"] or r["name"].split(" - ")[0]
+            key = (_dd_artist(r["artist"]), _dd_core(title), _dd_flags(title))
+            r["key"] = key
+            if r["dup"]:
+                if r["url"]:
+                    self.dup_url.setdefault(r["url"], r)
+            else:
+                if r["url"]:
+                    self.by_url.setdefault(r["url"], r)
+                if key[0] and key[1]:
+                    self.by_key.setdefault(key, []).append(r)
+
+    def _by_key(self, key, length):
+        for r in self.by_key.get(key, []):
+            if abs(r["len"] - length) <= max(3.0, 0.02 * r["len"]) or not length:
+                return r
+        return None
+
+    def find(self, track):
+        url, name, artist, secs = track
+        if url in self.by_url:
+            return self.by_url[url]
+        gone = self.dup_url.get(url)               # moved to _Duplicates: use the copy that was kept
+        if gone is not None:
+            kept = self._by_key(gone["key"], gone["len"])
+            if kept:
+                return kept
+        return self._by_key((_dd_artist(artist), _dd_core(name), _dd_flags(name)), secs)
+
+
+def build_playlists(cfg, refresh=True, dry_run=False):
+    "Runs inside the private venv (it has mutagen and spotDL)."
+    flags = {}
+    ids = load_ids(cfg["playlists_file"], flags)
+    wanted = [p for p in ids if flags[p][0] in ("P", "S") or (cfg["pl_files"] and flags[p][0] != "X")]
+    if not wanted:
+        return
+    try:
+        from mutagen import File as mutagen_file
+    except ImportError:
+        return
+    music_dir, state = cfg["music_dir"], cfg["state_dir"]
+    state.mkdir(parents=True, exist_ok=True)
+    cache_file = state / "playlist-cache.json"
+    try:
+        cache = json.loads(cache_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cache = {}
+    meta = {p: cache[p] for p in wanted if p in cache}
+    if refresh:
+        print(f"Playlist files: reading {len(wanted)} playlists from Spotify...")
+        _pl_client()
+        from concurrent.futures import ThreadPoolExecutor
+
+        def one(pid):
+            try:
+                return pid, _pl_fetch(pid)
+            except Exception as e:
+                return pid, str(e)[:80]
+        with ThreadPoolExecutor(3) as ex:
+            for pid, res in ex.map(one, wanted):
+                if isinstance(res, dict):
+                    meta[pid] = cache[pid] = res
+                elif pid not in meta:
+                    cprint(f"WARNING: could not read playlist {pid} ({res}). It is skipped for now.")
+        try:
+            cache_file.write_text(json.dumps(cache), encoding="utf-8")
+        except OSError:
+            pass
+    files, skipped = plan_playlists(cfg, meta, ids, flags)
+    if not files:
+        print("Playlist files: nothing to do (no playlist data yet: run  dl.py --playlists).")
+        return
+    folder = Path(os.path.expanduser(cfg["pl_folder"]))
+    folder = folder if folder.is_absolute() else music_dir / folder
+    merged = sum(1 for m in files.values() if len(m) > 1)
+    print(f"Playlist files: {len(wanted)} playlists -> {len(files)} files ({merged} combined groups"
+          f"{', ' + str(len(skipped)) + ' marked X' if skipped else ''}).")
+    if dry_run:
+        for fname, members in sorted(files.items(), key=lambda x: -len(x[1])):
+            if len(members) > 1:
+                print(f"  {paint(fname, 'bold')} <- " + " + ".join(meta[p]["name"] for p in members))
+        print("Nothing was written. Change a group with  S / X / =Group name  after an ID in playlists.txt,"
+              " or in playlist_groups.txt. Build the files with:  dl.py --playlists")
+        return
+    recs = _pl_library(music_dir, state, mutagen_file)
+    linker = _PlLinker(recs)
+    folder.mkdir(parents=True, exist_ok=True)
+    index_file = state / "playlists-index.json"
+    try:
+        old = json.loads(index_file.read_text(encoding="utf-8")).get("files", [])
+    except (OSError, ValueError, AttributeError):
+        old = []
+    written = []
+    for fname, members in files.items():
+        lines, seen, total, linked = ["#EXTM3U", "#PLAYLIST:" + fname], set(), 0, 0
+        for pid in members:
+            for track in meta[pid]["tracks"]:
+                total += 1
+                r = linker.find(track)
+                if r is None or r["p"] in seen:
+                    continue
+                seen.add(r["p"])
+                linked += 1
+                try:
+                    rel = os.path.relpath(r["p"], folder).replace("\\", "/")
+                except ValueError:                 # another drive on Windows
+                    rel = Path(r["p"]).as_posix()
+                lines.append(f"#EXTINF:{int(r['len'])},{r['artist'] or track[2]} - {r['title'] or track[1]}")
+                lines.append(rel)
+        target = folder / (fname + ".m3u8")
+        part = target.with_name(target.name + ".part")
+        part.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(part, target)
+        written.append(target.name)
+        extra = f" (combines {len(members)} playlists)" if len(members) > 1 else ""
+        cprint(f"  {fname}.m3u8: {linked} songs linked, {total - linked} not in the library yet{extra}")
+    for name in old:                               # files from an earlier run that are not wanted any more
+        if name not in written and name.endswith(".m3u8"):
+            try:
+                (folder / name).unlink()
+            except OSError:
+                pass
+    try:
+        index_file.write_text(json.dumps({"files": written}), encoding="utf-8")
+    except OSError:
+        pass
+    cprint(f"Playlist files saved in {folder}")
+
+
+def playlists_wanted(cfg):
+    "True if at least one playlist should get a playlist file."
+    try:
+        flags = {}
+        ids = load_ids(cfg["playlists_file"], flags)
+    except OSError:
+        return False
+    return any(flags[p][0] in ("P", "S") or (cfg["pl_files"] and flags[p][0] != "X") for p in ids)
 
 
 def run_inner(py, *args):
@@ -2392,6 +2771,10 @@ def main():
         say("Sorting songs into genre folders...")
         run_sorter(py)
 
+    if playlists_wanted(cfg):
+        say("Building playlist files...")
+        run_inner(py, "--playlists-inner")
+
     if cfg["dd_preview"]:
         say("Checking for duplicate songs (preview only, nothing is moved)...")
         run_inner(py, "--dedupe-inner", "--dry-run", "--no-ask")
@@ -2405,11 +2788,11 @@ if __name__ == "__main__":
         rest = [a for i, a in enumerate(args) if not (i and args[i - 1] == "--colors" and not a.startswith("-"))]
         known = {"-h", "--help", "--sort", "--dry-run", "--upgrade", "--dedupe", "--report",
                  "--sort-inner", "--seed-inner", "--upgrade-inner", "--dedupe-inner", "--report-only",
-                 "--no-ask", "--colors", "--themes"}
+                 "--no-ask", "--colors", "--themes", "--playlists", "--playlists-inner", "--cached"}
         if "-h" in args or "--help" in args:
             print(__doc__)
-        elif set(rest) - known or ("--dry-run" in args and not {"--sort", "--sort-inner", "--dedupe", "--dedupe-inner"} & set(args)):
-            sys.exit("Usage: dl.py [--sort | --dedupe [--dry-run]] [--report] [--upgrade] [--colors [NAME]] [--themes] [--help]\n"
+        elif set(rest) - known or ("--dry-run" in args and not {"--sort", "--sort-inner", "--dedupe", "--dedupe-inner", "--playlists", "--playlists-inner"} & set(args)):
+            sys.exit("Usage: dl.py [--sort | --dedupe | --playlists [--dry-run]] [--report] [--upgrade] [--colors [NAME]] [--themes] [--help]\n"
                      "(unknown option, or --dry-run used without --sort)")
         elif "--sort-inner" in args:            # runs inside the private venv (has mutagen)
             _cfg = load_config()
@@ -2419,6 +2802,13 @@ if __name__ == "__main__":
         elif "--colors" in args:                # show the colours in use, or preview a scheme
             i = args.index("--colors")
             show_colors(args[i + 1] if i + 1 < len(args) and not args[i + 1].startswith("-") else None)
+        elif "--playlists-inner" in args:       # runs inside the private venv (has mutagen, spotDL)
+            build_playlists(load_config(), refresh="--cached" not in args, dry_run="--dry-run" in args)
+        elif "--playlists" in args:
+            create_missing_files(need_playlists=True)
+            _cfg = load_config()
+            run_inner(ensure_spotdl(_cfg["venv_dir"]), "--playlists-inner",
+                      *(["--dry-run"] if "--dry-run" in args else []))
         elif "--dedupe-inner" in args:          # runs inside the private venv (has mutagen)
             run_dedupe(load_config(), "--dry-run" in args, "--report-only" in args,
                        ask="--no-ask" not in args and sys.stdin.isatty())
@@ -2441,7 +2831,10 @@ if __name__ == "__main__":
         elif "--sort" in args:                  # sort only, no download
             create_missing_files(need_playlists=False)
             _cfg = load_config()
-            run_sorter(ensure_spotdl(_cfg["venv_dir"]), "--dry-run" in args)
+            _py = ensure_spotdl(_cfg["venv_dir"])
+            run_sorter(_py, "--dry-run" in args)
+            if "--dry-run" not in args and playlists_wanted(_cfg) and (_cfg["state_dir"] / "playlist-cache.json").is_file():
+                run_inner(_py, "--playlists-inner", "--cached")
         else:
             main()
     except KeyboardInterrupt:

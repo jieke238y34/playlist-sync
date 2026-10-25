@@ -4,6 +4,7 @@ __pycache__/
 config.ini
 playlists.txt
 genre_overrides.txt
+playlist_groups.txt
 # never commit cookies or run state
 *cookies*.txt
 .dl-music/
