@@ -158,6 +158,24 @@ colour get the standard 16 colours (magenta, yellow, bright cyan).
   `systemd-inhibit`).
 - Windows and macOS are supported by design but were not tested by the author.
 
+## Built with
+
+`dl.py` does not include any of these. It installs or downloads them for you the first time it runs, into a
+private folder, so there is no `requirements.txt` to manage.
+
+| Project | What it is used for | Licence |
+|---|---|---|
+| [spotDL](https://github.com/spotDL/spotify-downloader) | Reads Spotify playlists and downloads the songs | MIT |
+| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Downloads audio from YouTube and SoundCloud | Unlicense |
+| [mutagen](https://github.com/quodlibet/mutagen) | Reads and writes song tags (comes with spotDL) | GPL-2.0-or-later |
+| [FFmpeg](https://ffmpeg.org) | Converts audio to MP3 (spotDL downloads it if you have none) | LGPL / GPL |
+| [Chromaprint](https://acoustid.org/chromaprint) | Optional audio fingerprints for the duplicate finder | LGPL-2.1 / MIT |
+| [Node.js](https://nodejs.org) | Optional: fewer YouTube errors | MIT |
+
+Their licences are their own. `dl.py` is GPL-2.0 and works with all of the above.
+
+This project is not affiliated with or endorsed by Spotify, YouTube, SoundCloud or any of the projects above.
+
 ## Responsible use
 
 This tool fetches audio from YouTube and SoundCloud. Only download music you have the right to
