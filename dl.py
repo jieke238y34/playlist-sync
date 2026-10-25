@@ -27,6 +27,7 @@ COMMANDS
     python3 dl.py --dedupe --dry-run  short summary, then type --expand (list the
                                     duplicates), --dedupe (move them) or --exit
     python3 dl.py --report          library report (sizes, formats, weakest files)
+    python3 dl.py --colors          show the colours that are in use (KDE Plasma colours if available)
     python3 dl.py --upgrade         SoundCloud upgrade only (songs still waiting from earlier runs)
     python3 dl.py --help            show this text
 
@@ -173,7 +174,86 @@ COLOR_ON = False
 PALETTE = {"ok": "36", "err": "1;31", "warn": "33", "bold": "1", "dim": "2"}
 
 
-def init_color(mode):
+def _lum(c):
+    def f(v):
+        v /= 255
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    return 0.2126 * f(c[0]) + 0.7152 * f(c[1]) + 0.0722 * f(c[2])
+
+
+def _contrast(a, b):
+    hi, lo = sorted((_lum(a), _lum(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _readable(c, bg, want=4.5):
+    "Move colour c toward white (dark background) or black (light one) until it is easy to read."
+    target = (255, 255, 255) if _lum(bg) < 0.4 else (0, 0, 0)
+    for _ in range(40):
+        if _contrast(c, bg) >= want:
+            break
+        c = tuple(round(v + (t - v) * 0.08) for v, t in zip(c, target))
+    return c
+
+
+def kde_palette():
+    "Colours of the KDE Plasma colour scheme, adjusted to read well. None if not on Plasma + true colour."
+    if os.name == "nt" or sys.platform == "darwin":
+        return None
+    if "KDE" not in os.environ.get("XDG_CURRENT_DESKTOP", "").upper():
+        return None
+    if os.environ.get("COLORTERM", "").lower() not in ("truecolor", "24bit"):
+        return None
+    try:
+        path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "kdeglobals"
+        got, sec = {}, ""
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line.startswith("[") and line.endswith("]"):
+                sec = line[1:-1]
+            elif sec == "Colors:View" and "=" in line:
+                k, v = line.split("=", 1)
+                parts = v.split(",")
+                if len(parts) == 3:
+                    got[k] = tuple(max(0, min(255, int(x))) for x in parts)
+        bg = got["BackgroundNormal"]
+    except (OSError, KeyError, ValueError):
+        return None
+
+    def pick(*names):
+        for n in names:
+            if n in got:
+                return got[n]
+        return None
+    ok = pick("ForegroundPositive")
+    if ok is None or max(ok) - min(ok) < 40:         # a grey "positive" colour looks like plain text
+        ok = pick("ForegroundLink", "DecorationFocus") or ok
+    err, warn = pick("ForegroundNegative"), pick("ForegroundNeutral")
+    dim, norm = pick("ForegroundInactive"), pick("ForegroundNormal")
+    if not (ok and err and warn and dim and norm):
+        return None
+    ok, err, warn, dim, norm = (_readable(c, bg) for c in (ok, err, warn, dim, norm))
+    code = lambda c: f"38;2;{c[0]};{c[1]};{c[2]}"
+    pal = {"ok": code(ok), "err": "1;" + code(err), "dim": code(dim), "bold": "1;" + code(norm)}
+    far = lambda a, b: sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5 > 90
+    if far(warn, ok) and far(warn, err):               # keep warnings apart from the other two
+        pal["warn"] = code(warn)
+    return pal
+
+
+def show_colors():
+    "dl.py --colors: print the colours that are in use."
+    kde = kde_palette()
+    print("Colour theme:", "KDE Plasma (from ~/.config/kdeglobals)" if kde and COLOR_ON else "standard terminal colours")
+    for kind, text in (("ok", "Downloaded / KEEP / good news"), ("warn", "WARNING / MOVE / careful"),
+                       ("err", "ERROR / failed / problem"), ("dim", "Skipped / waiting / low importance"),
+                       ("bold", "Headings and labels")):
+        print(f"  {kind:5} {paint(text, kind)}   [{PALETTE[kind]}]")
+    if not COLOR_ON:
+        print("(Colours are off here: no terminal, NO_COLOR is set, or color = no.)")
+
+
+def init_color(mode, theme="auto"):
     "Switch colours on or off for this process. On Windows this also enables ANSI codes."
     global COLOR_ON
     mode = (mode or "auto").lower()
@@ -196,6 +276,8 @@ def init_color(mode):
             COLOR_ON = False
             return
     COLOR_ON = True
+    if theme != "ansi":
+        PALETTE.update(kde_palette() or {})
 
 
 def paint(text, kind):
@@ -574,6 +656,12 @@ sort_after_download = yes
 # yes = always. no = never. Default: auto
 color = auto
 
+# Which colours to use. auto = copy your KDE Plasma colour scheme when running on Plasma in a
+# true-colour terminal (Konsole, Kitty...), otherwise the standard terminal colours.
+# The scheme colours are brightened where needed so they stay easy to read.
+# ansi = always the standard terminal colours. Check what you get with:  dl.py --colors
+theme = auto
+
 [dedupe]
 # Duplicate songs, broken files and a library report. Nothing is ever deleted: extra
 # copies move to the folder _Duplicates inside music_dir. Delete that folder yourself.
@@ -727,6 +815,7 @@ def load_config():
         "prefer_sc": yes_no("prefer_soundcloud", True, "sources"),
         "auto_update": yes_no("auto_update", True, "updates"),
         "color": cp.get("display", "color", fallback="auto").strip().lower() or "auto",
+        "theme": cp.get("display", "theme", fallback="auto").strip().lower() or "auto",
         "dd_preview": yes_no("preview_at_end", True, "dedupe"),
         "dd_fingerprint": yes_no("fingerprint", False, "dedupe"),
         "dd_cleanup": yes_no("cleanup", True, "dedupe"),
@@ -2134,18 +2223,21 @@ def main():
 if __name__ == "__main__":
     args = sys.argv[1:]
     try:
-        init_color(load_config()["color"])
+        _c = load_config()
+        init_color(_c["color"], _c["theme"])
         known = {"-h", "--help", "--sort", "--dry-run", "--upgrade", "--dedupe", "--report",
                  "--sort-inner", "--seed-inner", "--upgrade-inner", "--dedupe-inner", "--report-only",
-                 "--no-ask"}
+                 "--no-ask", "--colors"}
         if "-h" in args or "--help" in args:
             print(__doc__)
         elif set(args) - known or ("--dry-run" in args and not {"--sort", "--sort-inner", "--dedupe", "--dedupe-inner"} & set(args)):
-            sys.exit("Usage: dl.py [--sort | --dedupe [--dry-run]] [--report] [--upgrade] [--help]\n"
+            sys.exit("Usage: dl.py [--sort | --dedupe [--dry-run]] [--report] [--upgrade] [--colors] [--help]\n"
                      "(unknown option, or --dry-run used without --sort)")
         elif "--sort-inner" in args:            # runs inside the private venv (has mutagen)
             _cfg = load_config()
             sort_library(_cfg["music_dir"], _cfg["overrides_file"], "--dry-run" in args)
+        elif "--colors" in args:                # show the colours in use
+            show_colors()
         elif "--dedupe-inner" in args:          # runs inside the private venv (has mutagen)
             run_dedupe(load_config(), "--dry-run" in args, "--report-only" in args,
                        ask="--no-ask" not in args and sys.stdin.isatty())
