@@ -186,9 +186,11 @@ def is_block(line):
 COLOR_ON = False
 ACTIVE_THEME = "default"
 PALETTE = {"ok": "38;2;176;32;176", "err": "1;38;2;0;255;255", "warn": "38;2;255;214;0",
-           "bold": "1", "dim": "2"}
+           "bold": "1", "dim": "2", "blue": "38;2;66;153;255", "blue_hi": "38;2;150;200;255",
+           "blue_lo": "38;2;36;92;190", "blue_sh": "38;2;28;58;120"}
 DEFAULT_PALETTE = dict(PALETTE)
-ANSI_PALETTE = {"ok": "35", "err": "1;96", "warn": "33", "bold": "1", "dim": "2"}
+ANSI_PALETTE = {"ok": "35", "err": "1;96", "warn": "33", "bold": "1", "dim": "2", "blue": "94", "blue_hi": "1;94",
+                "blue_lo": "34", "blue_sh": "2;34"}
 
 
 def _lum(c):
@@ -301,6 +303,12 @@ def kde_palette(scheme=None):
     ok, err, warn, dim, norm = (_readable(c, bg) for c in (ok, err, warn, dim, norm))
     code = lambda c: f"38;2;{c[0]};{c[1]};{c[2]}"
     pal = {"ok": code(ok), "err": "1;" + code(err), "dim": code(dim), "bold": "1;" + code(norm)}
+    link = pick("ForegroundLink", "DecorationFocus")
+    if link:                                       # a scheme's link colour is usually a blue: its shades make the 3D art
+        base = _readable(link, bg)
+        mix = lambda c, t, k: tuple(round(v + (t - v) * k) for v in c)
+        pal.update({"blue": code(base), "blue_hi": code(mix(base, 255, 0.45)),
+                    "blue_lo": code(mix(base, 0, 0.40)), "blue_sh": code(mix(base, 0, 0.62))})
     far = lambda a, b, n: sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5 > n
     if far(warn, ok, 60) and far(warn, err, 45):       # keep warnings apart from the other two
         pal["warn"] = code(warn)
@@ -3329,7 +3337,7 @@ def _cassette_front(top, mid, low):
     return rows
 
 
-def cassette_parts(top, mid, low, depth=3):
+def cassette_parts(top, mid, low, depth=2):
     """The cassette as a 3D box (oblique view): front face, a lit top face, a shaded side face and a floor
     shadow. Returns rows; a row is a list of (text, part) with part front, top, side or shadow. Same width."""
     front = _cassette_front(top, mid, low)
@@ -3374,7 +3382,7 @@ def equalizer(width=52, unicode_ok=True):
 def _bar(frac, width, unicode_ok):
     n = max(0, min(width, round(frac * width)))
     full, empty = ("█", "░") if unicode_ok else ("#", "-")
-    return paint(full * n, "ok") + paint(empty * (width - n), "dim")
+    return paint(full * n, "blue") + paint(empty * (width - n), "blue_sh")
 
 
 def ego_pretty(st, unicode_ok=True):
@@ -3383,10 +3391,10 @@ def ego_pretty(st, unicode_ok=True):
     lines = [""]
     if st["songs"]:
         hours = f"{st['hours']:.0f} hours"
-        tint = {"front": "ok", "top": "bold", "side": "dim", "shadow": "dim"}
+        tint = {"front": "blue", "top": "blue_hi", "side": "blue_lo", "shadow": "blue_sh"}
         for row in cassette_parts("S O N G S", f"{st['songs']:,}", hours):
             lines.append("   " + "".join(paint(t, tint[part]) if t.strip() else t for t, part in row))
-        lines.append(paint("   " + " " * 2 + equalizer(52, unicode_ok), "err"))
+        lines.append(paint("   " + " " * 2 + equalizer(52, unicode_ok), "blue_hi"))
     note = "♪" if unicode_ok else "~"
     lines += ["", paint(f"   {note}  Y O U R   L I B R A R Y ,   I N   W O R D S  {note}", "bold"),
               paint("   " + ("─" if unicode_ok else "-") * 52, "dim"), ""]
@@ -3404,7 +3412,7 @@ def ego_pretty(st, unicode_ok=True):
             top = max(h.values())
             blocks = "▁▂▃▄▅▆▇█" if unicode_ok else ".:-=+*#@"
             bars = "".join(blocks[min(7, int(v / top * 7.99))] for v in h.values())
-            lines.append("   " + " " * 11 + paint(bars, "ok") + f"   {min(h)}s{dot}{max(h)}s")
+            lines.append("   " + " " * 11 + paint(bars, "blue") + f"   {min(h)}s{dot}{max(h)}s")
         lines.append("")
     return lines
 

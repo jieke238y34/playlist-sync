@@ -212,6 +212,19 @@ class EgoArt(unittest.TestCase):
         self.assertIn("186 hours", text)
         self.assertIn("#", text)                                      # the shaded side
 
+    def test_cassette_uses_only_blues(self):
+        for pal in (dl.PALETTE, dl.ANSI_PALETTE):
+            for key in ("blue", "blue_hi", "blue_lo", "blue_sh"):
+                self.assertIn(key, pal)
+        old, dl.COLOR_ON = dl.COLOR_ON, True
+        try:
+            text = "\n".join(dl.ego_pretty(self.stats(), unicode_ok=True)[:20])
+            for key in ("blue", "blue_hi", "blue_lo", "blue_sh"):
+                self.assertIn("\033[" + dl.PALETTE[key] + "m", text)
+            self.assertNotIn("\033[" + dl.PALETTE["ok"] + "m", text)        # no magenta in the cassette
+        finally:
+            dl.COLOR_ON = old
+
     def test_pretty_ascii_fallback(self):
         dl.COLOR_ON = False
         text = "\n".join(dl.ego_pretty(self.stats(), unicode_ok=False))
