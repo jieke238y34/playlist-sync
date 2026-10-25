@@ -33,7 +33,7 @@ downloads ffmpeg if your system has none.
 2. Run `python3 dl.py` (Windows: double-click it, or `py dl.py`).
 3. The first run creates `config.ini` and `playlists.txt` next to the script, then stops.
 4. Put your playlist links or IDs in `playlists.txt`, one per line, and check `config.ini`.
-5. Run `python3 dl.py` again.
+5. Run `python3 dl.py` or `py dl.py` again.
 
 Playlists must be **public**. Spotify-made playlists (Daily Mix, Discover Weekly, "This Is ...",
 IDs starting `37i9dQZF`) do not work: copy their songs into your own public playlist first.
