@@ -91,14 +91,15 @@ Every setting is explained in the file itself. `config.ini`, `playlists.txt` and
 
 ## Colours
 
-Output is coloured in a terminal: cyan for good news, yellow for warnings, bold red for
-problems, dim for low-importance lines. Log files stay plain text.
+Output is coloured in a terminal: deep dark magenta for good news, yellow for warnings, bold neon
+cyan for problems, dim for low-importance lines. Log files stay plain text. Terminals without true
+colour get the standard 16 colours (magenta, yellow, bright cyan).
 
 - On **KDE Plasma** with a true-colour terminal, it copies your Plasma colour scheme, brightened
   where needed so it stays easy to read on your background.
 - `theme = NAME` under `[display]` copies **any installed KDE colour scheme**, even one that is
   not active. See the choices with `--themes` and preview one with `--colors NAME`.
-- `theme = ansi` forces the standard terminal colours. `color = no` or the `NO_COLOR` setting turns
+- `theme = default` (the default) uses the colours above. `theme = ansi` forces the standard 16 terminal colours. `color = no` or the `NO_COLOR` setting turns
   colours off.
 
 ## Good to know

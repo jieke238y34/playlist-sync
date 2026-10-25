@@ -171,11 +171,14 @@ def is_block(line):
 # COLOURS (screen only: dl.log and the error files stay plain text)
 # config.ini [display] color = auto | yes | no.  auto = on in a terminal, off when the output
 # goes to a file or NO_COLOR is set. Change the numbers below to change a colour.
-# Cyan for good and bold red for bad: easy to tell apart with most kinds of colour blindness.
+# Default colours (true colour): deep dark magenta = good, yellow = warning, bold neon cyan = problem.
+# Terminals without true colour get the standard 16 colours (ANSI_PALETTE) instead.
 COLOR_ON = False
-ACTIVE_THEME = "auto"
-PALETTE = {"ok": "36", "err": "1;31", "warn": "33", "bold": "1", "dim": "2"}
+ACTIVE_THEME = "default"
+PALETTE = {"ok": "38;2;176;32;176", "err": "1;38;2;0;255;255", "warn": "38;2;255;214;0",
+           "bold": "1", "dim": "2"}
 DEFAULT_PALETTE = dict(PALETTE)
+ANSI_PALETTE = {"ok": "35", "err": "1;96", "warn": "33", "bold": "1", "dim": "2"}
 
 
 def _lum(c):
@@ -303,14 +306,15 @@ def show_colors(scheme=None):
                   "See the list with:  dl.py --themes")
         PALETTE.update(DEFAULT_PALETTE)
         PALETTE.update(pal or {})
-        title = f"Preview of the colour scheme '{scheme}'" if pal else "standard terminal colours"
+        title = f"preview of the colour scheme '{scheme}'" if pal else "the default colours"
+    elif PALETTE == ANSI_PALETTE:
+        title = "standard terminal colours (16 colours)"
+    elif PALETTE == DEFAULT_PALETTE:
+        title = "the default colours (dark magenta, yellow, neon cyan)"
+    elif ACTIVE_THEME.lower() == "auto":
+        title = "your active KDE Plasma colour scheme"
     else:
-        if PALETTE == DEFAULT_PALETTE:
-            title = "standard terminal colours"
-        elif ACTIVE_THEME.lower() == "auto":
-            title = "your active KDE Plasma colour scheme"
-        else:
-            title = f"colour scheme '{ACTIVE_THEME}' (from config.ini)"
+        title = f"colour scheme '{ACTIVE_THEME}' (from config.ini)"
     print("Colour theme:", title)
     for kind, text in (("ok", "Downloaded / KEEP / good news"), ("warn", "WARNING / MOVE / careful"),
                        ("err", "ERROR / failed / problem"), ("dim", "Skipped / waiting / low importance"),
@@ -356,8 +360,11 @@ def init_color(mode, theme="auto", quiet=False):
             COLOR_ON = False
             return
     COLOR_ON = True
-    if theme.lower() == "ansi":
+    if theme.lower() == "ansi" or not _truecolor():
+        PALETTE.update(ANSI_PALETTE)             # standard 16 colours
         return
+    if theme.lower() == "default":
+        return                                   # the built-in colours above
     if theme.lower() == "auto":
         PALETTE.update(kde_palette() or {})
     else:                                        # the name of any installed colour scheme, active or not
@@ -745,15 +752,18 @@ sort_after_download = yes
 color = auto
 
 # Which colours to use.
+#   default = deep dark magenta for good news, yellow for warnings, bold neon cyan for problems.
+#          (This is what you get if you leave it as it is. Needs a true-colour terminal.)
 #   auto = copy the KDE Plasma colour scheme that is active now (only on Plasma, in a true-colour
 #          terminal such as Konsole or Kitty). Otherwise the standard terminal colours.
 #   NAME = copy ANY KDE colour scheme you have installed, even if it is not the active one.
 #          Example:  theme = CatppuccinMocha     (a .colors file in ~/.local/share/color-schemes)
 #          Or a full path:  theme = /home/me/Downloads/Scheme.colors
 #          See the choices:  dl.py --themes     Preview one:  dl.py --colors NAME
-#   ansi = always the standard terminal colours.
+#   ansi = the standard 16 terminal colours (magenta, yellow, bright cyan).
 # Scheme colours are brightened where needed so they stay easy to read on your background.
-theme = auto
+# Terminals without true colour always get the standard 16 colours.
+theme = default
 
 [dedupe]
 # Duplicate songs, broken files and a library report. Nothing is ever deleted: extra
@@ -908,7 +918,7 @@ def load_config():
         "prefer_sc": yes_no("prefer_soundcloud", True, "sources"),
         "auto_update": yes_no("auto_update", True, "updates"),
         "color": cp.get("display", "color", fallback="auto").strip().lower() or "auto",
-        "theme": cp.get("display", "theme", fallback="auto").strip().strip("\"'") or "auto",
+        "theme": cp.get("display", "theme", fallback="auto").strip().strip("\"'") or "default",
         "dd_preview": yes_no("preview_at_end", True, "dedupe"),
         "dd_fingerprint": yes_no("fingerprint", False, "dedupe"),
         "dd_cleanup": yes_no("cleanup", True, "dedupe"),
