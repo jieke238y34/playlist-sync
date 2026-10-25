@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+# personal files, created by the first run of dl.py
+config.ini
+playlists.txt
+genre_overrides.txt
+# never commit cookies or run state
+*cookies*.txt
+.dl-music/
+archive*.txt
