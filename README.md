@@ -8,6 +8,25 @@ Under the hood it uses [spotDL](https://github.com/spotDL/spotify-downloader) an
 [yt-dlp](https://github.com/yt-dlp/yt-dlp). The script installs both into a private folder, and
 downloads ffmpeg if your system has none.
 
+## Features
+
+- **Download** whole Spotify playlists as 192 kbps MP3 with tags and cover art. Safe to run again and again:
+  songs you already have are skipped.
+- **YouTube first, SoundCloud upgrade**: when SoundCloud has a clean, full-length, non-DRM version it
+  replaces the YouTube file. Covers, remixes and previews are rejected.
+- **Playlist files**: every playlist also becomes a standard `.m3u8` file linking your songs, kept right
+  after sorting and cleanup. Similar playlists are combined ("chill autumn vibes" + "cozy autumn vibes" =
+  "Autumn Vibes"), and you can control it with `X`, `S`, `P` and `P=Group` after an ID.
+- **Duplicate finder**: same song on different albums, remasters and name variants are found, the best
+  quality copy stays, live and remix versions are kept, and nothing is ever deleted. Optional audio
+  fingerprints.
+- **Genre sorting** into folders, with your own `Artist=Folder` rules.
+- **Library report and cleanup**: songs, hours, size, formats, weakest files, broken files, empty folders.
+- **Progress with an ETA**: a rough time left and finish time after each song.
+- **Colour themes**: readable colours by default, or copy any installed KDE colour scheme.
+- **Careful by design**: pauses to avoid YouTube blocks, retry passes, a checksum-verified helper download,
+  logs that stay plain text.
+
 ## Quick start
 
 1. Install Python 3.10 to 3.14.
