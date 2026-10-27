@@ -863,6 +863,7 @@ class WebJsonRetries(unittest.TestCase):
         self.assertEqual(result, {"ok": 1})
 
 
+@unittest.skipUnless(HAVE_MUTAGEN, "mutagen is not installed (repair_genres needs it)")
 class RepairGenresWebErrors(unittest.TestCase):
     """repair_genres with a damaged cache entry and with the lookup refusing one artist."""
 
