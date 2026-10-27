@@ -1435,7 +1435,7 @@ def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
     finally:
         try:
             try:
-                if not _wait_unreaped(p, 30):
+                if not _wait_unreaped(p, 15):
                     _stop(p, force=True)
                 # spotDL is gone but a yt-dlp/ffmpeg child may linger. The group id is still ours
                 # (p is not collected yet), so this cannot hit another process. Empty group: no-op.
@@ -2837,8 +2837,11 @@ def pick_genre(tags, rules):
 def _save_tags(audio, path):
     "Save easy tags and keep the ID3 version an MP3 already has."
     if path.suffix.lower() == ".mp3":
-        from mutagen.id3 import ID3
-        v = ID3(path).version[1]
+        from mutagen.id3 import ID3, ID3NoHeaderError
+        try:
+            v = ID3(path).version[1]
+        except ID3NoHeaderError:                     # a file with no tag yet: the tag we write is the first
+            v = 4
         audio.save(v2_version=v if v in (3, 4) else 4)
     else:
         audio.save()
