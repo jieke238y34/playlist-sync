@@ -467,7 +467,30 @@ try:
             print("DL-OK " + song.url + " " + url + " " + song.display_name, flush=True)
         except Exception:
             pass
-    _o_results = _YT.get_results
+    from spotdl.types.result import Result as _Res
+    class _Quiet:
+        "A yt-dlp logger that says nothing. (spotDL's own one raises on every error.)"
+        def debug(self, m): pass
+        def info(self, m): pass
+        def warning(self, m): pass
+        def error(self, m): pass
+    def _yt_results(self, search_term, *_a, **_k):
+        "spotDL's YouTube search, but a result that cannot be read (age limit, login) is left out instead of failing the whole song."
+        from yt_dlp import YoutubeDL
+        opts = {**self.audio_handler.params, "skip_download": True, "ignoreerrors": True,
+                "logger": _Quiet(), "quiet": True, "no_warnings": True}
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info("ytsearch10:" + search_term, download=False)
+        out = []
+        for entry in (info or {}).get("entries") or []:
+            if not entry or not entry.get("id"):
+                continue
+            out.append(_Res(source=self.name, url="https://www.youtube.com/watch?v=" + entry["id"],
+                            verified=False, name=entry.get("title", ""), duration=entry.get("duration") or 0,
+                            author=entry.get("uploader") or "", search_query=search_term,
+                            views=entry.get("view_count") or 0, result_id=entry["id"]))
+        return out
+    _o_results = _yt_results
     def _results(self, term, *a, **k):
         if term not in _cache:                       # one YouTube search per song
             _cache[term] = _o_results(self, term, *a, **k)
@@ -633,6 +656,20 @@ try:
         c = e.__cause__ if e.__cause__ is not None else e
         t = str(c).strip().splitlines()
         return (t[0] if t else repr(c))[:200]
+    _dead = set()                                    # YouTube links that want a login: never tried twice
+    _LOGIN = ("confirm your age", "age-restricted", "age restricted", "please sign in",
+              "login required", "private video", "members-only", "join this channel")
+    def _need_login(e):
+        c = e.__cause__ if e.__cause__ is not None else e
+        t = (str(c) + " " + str(e)).lower()
+        return any(w in t for w in _LOGIN)
+    def _alt(dl, song, bad):
+        "The next acceptable YouTube result for this song, without the links that want a login."
+        yt = next((p for p in dl.audio_providers if isinstance(p, _YT)), None) or _fb.get("yt")
+        if yt is None:
+            return None
+        res = yt.get_results(_title(song.name, song.artists).lower())   # cached: no new search
+        return _loose(song, [r for r in res if r.url != bad and r.url not in _dead])
     def _get(self, url, download=False):
         try:
             out = _o_get(self, url, download)
@@ -642,6 +679,27 @@ try:
         except _AErr as e:
             if download:                             # spotDL hides this. dl.py needs it to see blocks.
                 print("  Reason: " + _why(e), flush=True)
+            if (download and not _NOFB and url in _seen and ("youtube.com" in url or "youtu.be" in url)
+                    and _need_login(e)):             # age-restricted or sign-in video: try another result
+                _dead.add(url)
+                dl0, song0 = _seen[url]
+                try:
+                    new = _alt(dl0, song0, url)
+                except Exception:
+                    new = None
+                if not new:
+                    raise
+                print("YouTube wants a login for that video. Trying another result for "
+                      + song0.display_name + ".", flush=True)
+                song0.download_url = new
+                _seen[new] = (dl0, song0)
+                try:
+                    out = _o_get(self, new, download)
+                    _mark(song0, new)
+                    return out
+                except _AErr as e3:
+                    print("  Reason: " + _why(e3), flush=True)
+                    raise
             if _NOFB or not (download and "soundcloud.com" in url and url in _seen):
                 raise
             dl, song = _seen[url]
@@ -660,6 +718,17 @@ try:
                 print("  Reason: " + _why(e2), flush=True)
                 raise
     _AP.get_download_metadata = _get
+    _o_views = _AP.get_views
+    def _views(self, url):
+        "spotDL ranks results by view count. A video that wants a login has none: rank it last, keep the song."
+        try:
+            return _o_views(self, url)
+        except _AErr as e:
+            if _need_login(e):
+                _dead.add(url)
+                return 0
+            raise
+    _AP.get_views = _views
 except Exception as _e:
     print("Note: the instant YouTube fallback is off (" + repr(_e) + ").", flush=True)
 """

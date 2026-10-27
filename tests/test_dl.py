@@ -738,5 +738,23 @@ class LoadIdsFlags(unittest.TestCase):
         self.assertEqual(ids, [C, A, B])
 
 
+class SpotdlPatch(unittest.TestCase):
+    "The code injected into spotDL cannot run here (no spotDL), so check it parses and keeps its key parts."
+
+    def test_patch_and_runner_are_valid_python(self):
+        import ast
+        ast.parse(dl.SPOTDL_PATCH)
+        ast.parse(dl.SPOTDL_RUNNER)
+
+    def test_search_skips_results_that_want_a_login(self):
+        # One age-restricted result among the ten used to fail the whole song.
+        self.assertIn('"ignoreerrors": True', dl.SPOTDL_PATCH)
+        self.assertIn("ytsearch10:", dl.SPOTDL_PATCH)
+
+    def test_view_count_lookup_and_login_fallback_are_patched(self):
+        self.assertIn("_AP.get_views = _views", dl.SPOTDL_PATCH)
+        self.assertIn("_need_login", dl.SPOTDL_PATCH)
+
+
 if __name__ == "__main__":
     unittest.main()
