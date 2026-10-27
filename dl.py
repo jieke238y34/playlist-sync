@@ -73,6 +73,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import threading
 import sys
 import tarfile
 import tempfile
@@ -1344,12 +1345,37 @@ def _stop(p, force=False):
     "Stop spotDL and what it started (yt-dlp, ffmpeg). On Linux/macOS they share its process group."
     import signal
     try:
-        if IS_WIN:
-            (p.kill if force else p.terminate)()
+        if IS_WIN:                                   # no process groups: /T also ends its children
+            subprocess.run(["taskkill", "/T", "/F" if force else "/T", "/PID", str(p.pid)],
+                           capture_output=True, timeout=15)
         else:
             os.killpg(p.pid, signal.SIGKILL if force else signal.SIGTERM)
-    except OSError:
+    except (OSError, subprocess.SubprocessError):
         pass
+
+
+def _wait_unreaped(p, seconds):
+    """Wait up to `seconds` for p to exit WITHOUT collecting it, so its process group id stays
+    reserved and a later killpg cannot hit a stranger. True if it exited. (Linux only: os.waitid.)"""
+    if IS_WIN or not hasattr(os, "waitid"):
+        try:
+            p.wait(timeout=seconds)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+    end = time.time() + seconds
+    while time.time() < end:
+        try:
+            if os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT):
+                return True
+        except ChildProcessError:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+class _Terminate(KeyboardInterrupt):
+    "Raised by a SIGTERM/SIGHUP handler so dl.py cleans up its children before it dies."
 
 
 def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
@@ -1357,8 +1383,15 @@ def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
     marks: if given, gets the DL-OK lines of finished downloads (not shown, not logged).
     on_line: if given, called with every line. It may return an ETA line to show (screen only).
     Returns (exit code, stopped by us, block-error lines). When spotDL ran out of file handles
-    the block lines are [NOFILE_MARK]: a fresh process fixes that, so it is not a block."""
+    the block lines end with NOFILE_MARK: a fresh process fixes that, so it is not a block."""
+    import signal
     block_lines, hit, nofile = [], False, 0
+    old_handlers = {}
+    if not IS_WIN and threading.current_thread() is threading.main_thread():
+        def _die(signum, frame):
+            raise _Terminate()
+        for s in (signal.SIGTERM, signal.SIGHUP):    # the child has its own session: it will not see these
+            old_handlers[s] = signal.signal(s, _die)
     p = subprocess.Popen(cmd, cwd=cwd, env=CHILD_ENV, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True,
                          encoding="utf-8", errors="replace", start_new_session=not IS_WIN)
@@ -1388,7 +1421,7 @@ def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
                     print(colorize_line(NOFILE_MARK + ". Stopping spotDL; the playlist runs again in a fresh process."))
                     _stop(p)
                     hit = True
-                    block_lines = [NOFILE_MARK]
+                    block_lines.append(NOFILE_MARK)  # real block lines stay: the caller tells them apart
                     break
             if is_block(line):
                 block_lines.append(line.rstrip())
@@ -1396,16 +1429,29 @@ def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
                     hit = True
                     _stop(p)
                     break
-    except BaseException:                            # Ctrl+C, or an error in on_line: leave nothing running
+    except BaseException:                            # Ctrl+C, SIGTERM, or an error in on_line
         _stop(p)
         raise
     finally:
         try:
-            p.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            _stop(p, force=True)
-            p.wait()
-        p.stdout.close()
+            try:
+                if not _wait_unreaped(p, 30):
+                    _stop(p, force=True)
+                # spotDL is gone but a yt-dlp/ffmpeg child may linger. The group id is still ours
+                # (p is not collected yet), so this cannot hit another process. Empty group: no-op.
+                _stop(p, force=True)
+                p.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                pass                                 # stuck in the kernel (hung mount): do not hang the run
+            except KeyboardInterrupt:                # a second Ctrl+C: stop waiting, still clean up below
+                _stop(p, force=True)
+        finally:
+            try:
+                p.stdout.close()
+            except OSError:
+                pass
+            for s, h in old_handlers.items():
+                signal.signal(s, h)
     return p.returncode, hit, block_lines
 
 
@@ -3706,15 +3752,16 @@ def main():
             marks = []
             eta.begin_playlist(n, pid)
             rc, hit, block_lines = run_playlist(cmd, music, log, cfg["max_block"], marks, eta.line)
-            if block_lines == [NOFILE_MARK]:         # not a block: a fresh process has its handles back
+            if NOFILE_MARK in block_lines:           # not a block: a fresh process has its handles back
                 say(f"spotDL ran out of file handles on {pid}. Running the playlist again once.")
                 time.sleep(5)
                 rc, hit, block_lines = run_playlist(cmd, music, log, cfg["max_block"], marks, eta.line)
-                if block_lines == [NOFILE_MARK]:     # still failing: now it counts as a failure
-                    block_lines = ["spotDL ran out of file handles twice in a row (Errno 24)"]
+                if NOFILE_MARK in block_lines:       # still failing: now it counts as a failure
+                    block_lines = [l for l in block_lines if l != NOFILE_MARK]
+                    block_lines.append("spotDL ran out of file handles twice in a row (Errno 24)")
             eta.end_playlist()
             if upgrade_on:
-                queue_upgrades(state, marks)
+                queue_upgrades(state, list(dict.fromkeys(marks)))   # a rerun can repeat a finished song
 
             with err.open("a", encoding="utf-8") as f:
                 if hit:
