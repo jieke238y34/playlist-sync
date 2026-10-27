@@ -890,7 +890,7 @@ genre_repair = yes
 
 # How many artists to look up per run. MusicBrainz allows one question a second, so 100 takes a few
 # minutes. The answers are saved, so every run finishes more of the library.
-genre_repair_limit = 100
+genre_repair_limit = 300
 
 # OPTIONAL - a free Last.fm API key (last.fm/api). It is faster and has more tags than MusicBrainz.
 lastfm_api_key =
@@ -1106,7 +1106,7 @@ def load_config():
         "color": cp.get("display", "color", fallback="auto").strip().lower() or "auto",
         "theme": cp.get("display", "theme", fallback="auto").strip().strip("\"'") or "default",
         "gen_repair": yes_no("genre_repair", True, "genres"),
-        "gen_limit": number_in("genres", "genre_repair_limit", 100),
+        "gen_limit": number_in("genres", "genre_repair_limit", 300),
         "lastfm_key": cp.get("genres", "lastfm_api_key", fallback="").strip(),
         "gap_report": yes_no("gap_report", True, "playlists"),
         "smart": yes_no("smart_playlists", True, "playlists"),
@@ -3003,6 +3003,38 @@ def _gr_lastfm(artist, key):
     return [t["name"] for t in d.get("toptags", {}).get("tag", []) if int(t.get("count", 0) or 0) >= 20]
 
 
+_ITUNES_OFF = []                                     # set once iTunes says "too many requests": not asked again this run
+
+
+def _gr_itunes(artist):
+    """The main genre Apple lists for an artist ([] if it does not know them). Free, no key; a good
+    second source for artists MusicBrainz has no genres for."""
+    if _ITUNES_OFF:
+        return []
+    want = _dd_artist(artist)
+    try:
+        d = _web_json("https://itunes.apple.com/search?entity=musicArtist&limit=5&term="
+                      + urllib.parse.quote(artist), {"Accept": "application/json"}, tries=2)
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 429):                     # their rate limit: leave iTunes alone for now
+            _ITUNES_OFF.append(e.code)
+            return []
+        raise
+    for a in d.get("results", []):
+        if _dd_artist(a.get("artistName", "")) == want and a.get("primaryGenreName"):
+            return [a["primaryGenreName"]]
+    return []
+
+
+def _gr_lookup(name, key):
+    "Genre tags for one artist: Last.fm with a key, else MusicBrainz; iTunes when that knows nothing."
+    tags = _gr_lastfm(name, key) if key else _gr_musicbrainz(name)
+    if not tags and not _ITUNES_OFF:
+        time.sleep(1.5)                              # iTunes allows roughly 20 requests a minute
+        tags = _gr_itunes(name)
+    return tags
+
+
 def pick_genre(tags, rules):
     "(tag, folder) for the first tag that maps to a genre folder other than Other, or (None, None)."
     for tag in tags:
@@ -3064,7 +3096,7 @@ def repair_genres(cfg, dry_run=False):
         for k in batch:
             name = targets[k][0][0]["artist"].split(";")[0].strip()
             try:
-                tags = _gr_lastfm(name, cfg["lastfm_key"]) if cfg["lastfm_key"] else _gr_musicbrainz(name)
+                tags = _gr_lookup(name, cfg["lastfm_key"])
             except urllib.error.HTTPError as e:
                 if e.code == 404:                     # not found: remember it and go on
                     cache[k] = {"tags": [], "ts": now, "src": src}

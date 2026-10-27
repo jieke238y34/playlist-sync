@@ -783,6 +783,56 @@ class PlannedRestart(unittest.TestCase):
         self.assertLessEqual(dl._fd_recycle_at(), 600)
 
 
+class GenreFromItunes(unittest.TestCase):
+    "iTunes is the free second source for artists MusicBrainz knows nothing about."
+
+    def setUp(self):
+        dl._ITUNES_OFF.clear()
+        self.addCleanup(dl._ITUNES_OFF.clear)
+
+    def stub(self, reply):
+        from unittest import mock
+        return mock.patch.object(dl, "_web_json", side_effect=reply if isinstance(reply, Exception) else None,
+                                 return_value=None if isinstance(reply, Exception) else reply)
+
+    def test_exact_artist_gives_its_main_genre(self):
+        with self.stub({"results": [{"artistName": "Radiohead", "primaryGenreName": "Alternative"}]}):
+            self.assertEqual(dl._gr_itunes("Radiohead"), ["Alternative"])
+
+    def test_a_different_artist_is_not_accepted(self):
+        with self.stub({"results": [{"artistName": "Radiohead Tribute Band", "primaryGenreName": "Rock"}]}):
+            self.assertEqual(dl._gr_itunes("Radiohead"), [])
+
+    def test_unknown_artist_gives_nothing(self):
+        with self.stub({"results": []}):
+            self.assertEqual(dl._gr_itunes("zzqxy"), [])
+
+    def test_rate_limit_switches_itunes_off_for_the_run(self):
+        import io, urllib.error
+        err = urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(b""))
+        with self.stub(err) as m:
+            self.assertEqual(dl._gr_itunes("A"), [])
+            self.assertEqual(dl._gr_itunes("B"), [])        # not asked again
+            self.assertEqual(m.call_count, 1)
+        self.assertTrue(dl._ITUNES_OFF)
+
+    def test_lookup_uses_itunes_only_when_the_first_source_is_empty(self):
+        from unittest import mock
+        with mock.patch.object(dl, "_gr_musicbrainz", return_value=["rock"]), \
+                mock.patch.object(dl, "_gr_itunes", return_value=["Pop"]) as it, mock.patch.object(dl.time, "sleep"):
+            self.assertEqual(dl._gr_lookup("X", ""), ["rock"])
+            it.assert_not_called()
+        with mock.patch.object(dl, "_gr_musicbrainz", return_value=[]), \
+                mock.patch.object(dl, "_gr_itunes", return_value=["Pop"]), mock.patch.object(dl.time, "sleep"):
+            self.assertEqual(dl._gr_lookup("X", ""), ["Pop"])
+
+    def test_apple_genre_names_map_to_library_folders(self):
+        rules = dl._compile_rules()
+        for apple, folder in (("Hip-Hop/Rap", "Hip-Hop"), ("R&B/Soul", "R&B"), ("Dance", "Electronic"),
+                              ("Heavy Metal", "Metal"), ("Indie Rock", "Alternative")):
+            self.assertEqual(dl.pick_genre([apple], rules)[1], folder, apple)
+
+
 class SpotdlPatch(unittest.TestCase):
     "The code injected into spotDL cannot run here (no spotDL), so check it parses and keeps its key parts."
 
