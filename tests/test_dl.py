@@ -372,5 +372,371 @@ class OutOfHandles(unittest.TestCase):
         self.assertIn("done", log)
 
 
+try:
+    import mutagen  # noqa: F401
+    HAVE_MUTAGEN = True
+except ImportError:
+    HAVE_MUTAGEN = False
+
+MPEG_FRAME = bytes([0xFF, 0xFB, 0x90, 0x00]) + bytes(413)      # one silent-looking MP3 frame, no ID3 header
+
+
+class GenreFolderFromWebTags(unittest.TestCase):
+    def setUp(self):
+        self.rules = dl._compile_rules()
+
+    def test_empty_tag_list_gives_no_folder(self):
+        self.assertEqual(dl.pick_genre([], self.rules), (None, None))
+
+    def test_only_other_is_never_picked(self):
+        self.assertEqual(dl.pick_genre(["seen live", "favorites"], self.rules), (None, None))
+
+    def test_tag_with_underscores_and_capitals_still_maps(self):
+        self.assertEqual(dl.pick_genre(["Hip_Hop"], self.rules), ("Hip_Hop", "Hip-Hop"))
+
+    def test_exact_words_do_not_match_inside_other_words(self):
+        self.assertIsNone(dl.folder_for_genre("dnbfoo", self.rules))
+        self.assertEqual(dl.folder_for_genre("dnb", self.rules), "Electronic")
+
+    def test_unicode_tag_does_not_crash(self):
+        self.assertEqual(dl.pick_genre(["日本語", "j-pop"], self.rules), ("j-pop", "Pop"))
+
+    def test_artist_key_with_quotes_and_lucene_characters(self):
+        for name in ('Guns N\' "Roses"', "AC/DC", "Florence + the Machine", "!!!", "P!nk", "(Sandy) Alex G", "Beyoncé"):
+            key = dl._dd_artist(name)
+            self.assertIsInstance(key, str)
+            self.assertNotIn('"', key)
+        self.assertEqual(dl._dd_artist("AC/DC"), "ac")             # first artist only: the "/" splits it
+        self.assertEqual(dl._dd_artist("!!!"), "")                 # empty key: repair_genres skips the song
+
+    def test_musicbrainz_query_escapes_quotes_and_lucene_characters(self):
+        seen = []
+        old = dl._web_json
+        dl._web_json = lambda url, headers=None, tries=3: (seen.append(url), {"artists": []})[1]
+        try:
+            self.assertEqual(dl._gr_musicbrainz('Say "Hi" AND (x) OR y:z\\'), [])
+        finally:
+            dl._web_json = old
+        self.assertEqual(len(seen), 1)
+        self.assertNotIn('"Hi"', seen[0])                # raw quotes would break out of artist:"..."
+        self.assertNotIn(" ", seen[0])
+        self.assertIn("%22Hi%22", seen[0])
+
+
+class RepairGenresMoves(unittest.TestCase):
+    """repair_genres with the web answers already in genre-cache.json and the library scan replaced,
+    so nothing touches the network or needs real audio."""
+
+    def run_repair(self, files, artists, tags, dry_run=False, make_sidecar=False, prefill=None, id3=True):
+        import io, json, sys, time
+        out = {}
+        with tempfile.TemporaryDirectory() as d:
+            music, state = Path(d) / "Music", Path(d) / "state"
+            recs = []
+            for rel, artist in zip(files, artists):
+                f = music / rel
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_bytes(MPEG_FRAME * 5)
+                if id3:                                      # a real (empty-ish) ID3 header, as spotDL writes
+                    from mutagen.id3 import ID3, TIT2
+                    tags_ = ID3()
+                    tags_.add(TIT2(encoding=3, text=["t"]))
+                    tags_.save(f, v2_version=3)
+                if make_sidecar:
+                    f.with_suffix(".lrc").write_text("la", encoding="utf-8")
+                recs.append(song(f.stem, artist=artist, path=str(f), genre=""))
+            for rel, data in (prefill or {}).items():
+                (music / rel).parent.mkdir(parents=True, exist_ok=True)
+                (music / rel).write_bytes(data)
+            state.mkdir()
+            cache = {dl._dd_artist(a): {"tags": tags, "ts": time.time(), "src": "MusicBrainz"} for a in artists}
+            (state / "genre-cache.json").write_text(json.dumps(cache), encoding="utf-8")
+            cfg = {"music_dir": music, "state_dir": state, "gen_limit": 0, "lastfm_key": ""}
+            saved = (dl._pl_library, dl._web_json, sys.stdout)
+
+            def no_net(*a, **k):
+                raise AssertionError("repair_genres went to the network")
+            dl._pl_library = lambda m, s, mf: recs
+            dl._web_json = no_net
+            sys.stdout = io.StringIO()
+            try:
+                dl.repair_genres(cfg, dry_run=dry_run)
+                out["stdout"] = sys.stdout.getvalue()
+            finally:
+                dl._pl_library, dl._web_json, sys.stdout = saved
+            out["tree"] = sorted(str(p.relative_to(music)) for p in music.rglob("*") if p.is_file())
+            out["read"] = {str(p.relative_to(music)): p.read_bytes() for p in music.rglob("*") if p.is_file()}
+            log = state / "genre-repair-log.txt"
+            out["log"] = log.read_text(encoding="utf-8") if log.exists() else ""
+        return out
+
+    @unittest.skipUnless(HAVE_MUTAGEN, "mutagen is not installed")
+    def test_moves_song_out_of_other_into_genre_folder(self):
+        out = self.run_repair(["Other/a.mp3"], ["Band"], ["indie rock"])
+        self.assertIn("Alternative/a.mp3", out["tree"], out["stdout"])
+        self.assertNotIn("Other/a.mp3", out["tree"])
+        self.assertIn("a.mp3", out["log"])
+
+    @unittest.skipUnless(HAVE_MUTAGEN, "mutagen is not installed")
+    def test_name_collision_in_target_folder_keeps_both_files(self):
+        out = self.run_repair(["Other/a.mp3"], ["Band"], ["pop"], prefill={"Pop/a.mp3": b"KEEP"})
+        self.assertEqual(out["read"].get("Pop/a.mp3"), b"KEEP", out["stdout"])
+        self.assertEqual(len(out["tree"]), 2, out["stdout"])
+        self.assertIn("Pop/a (2).mp3", out["tree"], out["stdout"])
+
+    @unittest.skipUnless(HAVE_MUTAGEN, "mutagen is not installed")
+    def test_lyrics_sidecar_moves_with_the_song(self):
+        out = self.run_repair(["Unknown/a.mp3"], ["Band"], ["pop"], make_sidecar=True)
+        self.assertIn("Pop/a.lrc", out["tree"], out["stdout"])
+        self.assertNotIn("Unknown/a.lrc", out["tree"])
+
+    @unittest.skipUnless(HAVE_MUTAGEN, "mutagen is not installed")
+    def test_dry_run_changes_nothing(self):
+        out = self.run_repair(["Other/a.mp3"], ["Band"], ["pop"], dry_run=True)
+        self.assertEqual(out["tree"], ["Other/a.mp3"])
+        self.assertEqual(out["log"], "")
+
+    @unittest.skipUnless(HAVE_MUTAGEN, "mutagen is not installed")
+    def test_odd_unicode_and_quote_names_move(self):
+        out = self.run_repair(['Other/Beyoncé - "Halo" ❤ 日本.mp3'], ['Beyoncé'], ["r&b"])
+        self.assertEqual(out["tree"], ['R&B/Beyoncé - "Halo" ❤ 日本.mp3'], out["stdout"])
+
+    @unittest.skipUnless(HAVE_MUTAGEN, "mutagen is not installed")
+    def test_unmatched_tags_leave_song_in_place(self):
+        out = self.run_repair(["Other/a.mp3"], ["Band"], ["seen live"])
+        self.assertEqual(out["tree"], ["Other/a.mp3"])
+
+    @unittest.skipUnless(HAVE_MUTAGEN, "mutagen is not installed")
+    def test_song_already_in_a_genre_folder_is_not_moved(self):
+        out = self.run_repair(["Jazz/a.mp3"], ["Band"], ["pop"])
+        self.assertEqual(out["tree"], ["Jazz/a.mp3"])
+
+    @unittest.skipUnless(HAVE_MUTAGEN, "mutagen is not installed")
+    def test_empty_library_is_a_clean_no_op(self):
+        out = self.run_repair([], [], [])
+        self.assertIn("every song already has a genre", out["stdout"])
+
+    @unittest.skipUnless(HAVE_MUTAGEN, "mutagen is not installed")
+    def test_mp3_without_id3_header_is_still_moved(self):
+        # A tagless MP3 has no ID3 header. If writing the genre tag fails, the song must not be stranded
+        # in Other with the error swallowed: the genre is known, so the move should still happen.
+        out = self.run_repair(["Other/a.mp3"], ["Band"], ["pop"], id3=False)
+        self.assertEqual(out["tree"], ["Pop/a.mp3"], out["stdout"])
+
+    @unittest.skipUnless(HAVE_MUTAGEN, "mutagen is not installed")
+    def test_mp3_without_id3_header_never_loses_the_file(self):
+        out = self.run_repair(["Other/a.mp3"], ["Band"], ["pop"], id3=False)
+        self.assertEqual(len(out["tree"]), 1)                    # moved or kept, but never deleted
+
+
+class StopIgnoresSigterm(unittest.TestCase):
+    STUBBORN = ("import signal, sys, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "print('ready', flush=True)\n"
+                "while True: time.sleep(0.2)\n")
+
+    def setUp(self):
+        if dl.IS_WIN:
+            self.skipTest("process groups are POSIX only")
+
+    def spawn(self, code):
+        import subprocess, sys
+        p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True,
+                             start_new_session=True)
+        self.addCleanup(p.stdout.close)
+        self.addCleanup(lambda: p.poll() is None and (p.kill(), p.wait()))
+        self.assertEqual(p.stdout.readline().strip(), "ready")
+        return p
+
+    def test_sigterm_alone_does_not_kill_it_but_force_does(self):
+        import signal, subprocess
+        p = self.spawn(self.STUBBORN)
+        dl._stop(p)                                        # SIGTERM to the group: ignored
+        with self.assertRaises(subprocess.TimeoutExpired):
+            p.wait(timeout=0.7)
+        dl._stop(p, force=True)
+        self.assertEqual(p.wait(timeout=10), -signal.SIGKILL)
+
+    def test_force_kill_reaches_grandchildren_in_the_group(self):
+        import time
+        code = ("import subprocess, sys\n"
+                "c = subprocess.Popen([sys.executable, '-c', 'import signal,time\\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\\ntime.sleep(60)'])\n"
+                "print('ready', flush=True)\n"
+                "c.wait()\n")
+        p = self.spawn(code)
+        kids = Path(f"/proc/{p.pid}/task/{p.pid}/children")
+        if not kids.exists():
+            self.skipTest("needs /proc")
+        deadline = time.time() + 5
+        while not kids.read_text().split() and time.time() < deadline:
+            time.sleep(0.05)
+        child = int(kids.read_text().split()[0])
+        dl._stop(p, force=True)
+        p.wait(timeout=10)
+        stat = Path(f"/proc/{child}/stat")
+        deadline = time.time() + 5
+        while time.time() < deadline and stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[0] != "Z":
+            time.sleep(0.05)
+        state = stat.read_text().rsplit(")", 1)[1].split()[0] if stat.exists() else "gone"
+        self.assertIn(state, ("gone", "Z"), "grandchild survived the group SIGKILL")
+
+    def test_stop_on_an_already_dead_process_does_not_raise(self):
+        import subprocess, sys
+        p = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        p.wait()
+        dl._stop(p)
+        dl._stop(p, force=True)
+
+    def test_run_playlist_force_kills_when_sigterm_is_ignored_after_errno_24(self):
+        import io, subprocess, sys, time, types
+        code = ("import signal, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "for _ in range(6): print('OSError: [Errno 24] Too many open files', flush=True)\n"
+                "time.sleep(60)\n")
+        log, old = io.StringIO(), sys.stdout
+        class Quick(subprocess.Popen):                       # do not make the test wait the full 30 s
+            def wait(self, timeout=None):
+                return super().wait(timeout=None if timeout is None else min(timeout, 2))
+        real = dl.subprocess
+        dl.subprocess = types.SimpleNamespace(**{k: getattr(subprocess, k) for k in dir(subprocess)
+                                                 if not k.startswith("__")}, )
+        dl.subprocess.Popen = Quick
+        sys.stdout = io.StringIO()
+        t0 = time.time()
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                rc, hit, lines = dl.run_playlist([sys.executable, "-c", code], d, log, 8)
+        finally:
+            dl.subprocess = real
+            sys.stdout = old
+        self.assertTrue(hit)
+        self.assertEqual(lines, [dl.NOFILE_MARK])
+        self.assertEqual(rc, -9)                           # SIGKILL: the SIGTERM was ignored
+        self.assertLess(time.time() - t0, 20)
+
+    def test_fd_report_counts_a_pipe_and_a_file(self):
+        import os
+        if not Path("/proc/self/fd").exists():
+            self.skipTest("needs /proc")
+        r, w = os.pipe()
+        try:
+            with tempfile.TemporaryDirectory() as d, open(Path(d) / "x", "w"):
+                rep = dl.fd_report(os.getpid())
+        finally:
+            os.close(r)
+            os.close(w)
+        self.assertRegex(rep, r"file=\d+")
+        self.assertRegex(rep, r"pipe=\d+")
+
+    def test_fd_report_total_matches_the_parts(self):
+        import os
+        if not Path("/proc/self/fd").exists():
+            self.skipTest("needs /proc")
+        m = re.match(r"FD-WATCH (\d+) (.*)", dl.fd_report(os.getpid()))
+        self.assertTrue(m)
+        self.assertEqual(int(m.group(1)), sum(int(x.split("=")[1]) for x in m.group(2).split()))
+
+    def test_nofile_mark_is_not_a_youtube_block(self):
+        self.assertFalse(dl.is_block(dl.NOFILE_MARK))
+
+
+class LoadIdsFlags(unittest.TestCase):
+    def read(self, text):
+        import io, sys
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "playlists.txt"
+            p.write_text(text, encoding="utf-8")
+            flags = {}
+            old, sys.stdout = sys.stdout, io.StringIO()
+            try:
+                ids = dl.load_ids(p, flags)
+                return ids, flags, sys.stdout.getvalue()
+            finally:
+                sys.stdout = old
+
+    def test_23_char_id_with_each_flag_letter(self):
+        for letter in "PSX":
+            ids, flags, _ = self.read(f"{A}{letter}\n")
+            self.assertEqual(ids, [A])
+            self.assertEqual(flags[A], (letter, ""))
+
+    def test_23_char_lower_case_flag_letter(self):
+        ids, flags, _ = self.read(f"{A}s\n")
+        self.assertEqual(flags[A], ("S", ""))
+
+    def test_23_char_with_a_bad_letter_is_skipped(self):
+        ids, flags, out = self.read(f"{A}Z\n")
+        self.assertEqual(ids, [])
+        self.assertIn("SKIPPED", out)
+
+    def test_24_chars_is_skipped(self):
+        ids, _, out = self.read(f"{A}PP\n")
+        self.assertEqual(ids, [])
+        self.assertIn("SKIPPED", out)
+
+    def test_21_chars_is_skipped(self):
+        ids, _, out = self.read(A[:21] + "\n")
+        self.assertEqual(ids, [])
+
+    def test_23_char_id_glued_flag_and_group(self):
+        ids, flags, _ = self.read(f"{A}P=Road Trip\n")
+        self.assertEqual(flags[A], ("P", "Road Trip"))
+
+    def test_group_only_keeps_group_with_empty_flag(self):
+        ids, flags, _ = self.read(f"{A} =Gym\n")
+        self.assertEqual(flags[A], ("", "Gym"))
+
+    def test_group_name_with_unicode_and_inner_spaces(self):
+        ids, flags, _ = self.read(f"{A} P = Café  del Mar 日本\n")
+        self.assertEqual(flags[A], ("P", "Café  del Mar 日本"))
+
+    def test_group_stops_at_comment(self):
+        ids, flags, _ = self.read(f"{A} P=Gym # not part of the name\n")
+        self.assertEqual(flags[A], ("P", "Gym"))
+
+    def test_duplicate_s_then_p_gives_p(self):
+        ids, flags, _ = self.read(f"{A} S\n{A} P=G\n")
+        self.assertEqual(ids, [A])
+        self.assertEqual(flags[A], ("P", "G"))
+
+    def test_duplicate_keeps_first_group(self):
+        ids, flags, _ = self.read(f"{A} P=First\n{A} P=Second\n")
+        self.assertEqual(flags[A], ("P", "First"))
+
+    def test_duplicate_x_then_s_gives_s(self):
+        ids, flags, _ = self.read(f"{A} X\n{A} S\n")
+        self.assertEqual(flags[A], ("S", ""))
+
+    def test_quoted_and_comma_separated_with_flag(self):
+        ids, flags, _ = self.read(f'"{A}", X\n')
+        self.assertEqual(ids, [A])
+        self.assertEqual(flags[A], ("X", ""))
+
+    def test_quoted_id_with_trailing_comma(self):
+        ids, flags, _ = self.read(f'"{A}",\n')
+        self.assertEqual(ids, [A])
+
+    def test_spotify_uri_with_flag(self):
+        ids, flags, _ = self.read(f"spotify:playlist:{B} S\n")
+        self.assertEqual(flags[B], ("S", ""))
+
+    def test_empty_comment_only_and_bom_files(self):
+        self.assertEqual(self.read("")[0], [])
+        self.assertEqual(self.read("# nothing\n\n   \n")[0], [])
+        ids, flags, _ = self.read("﻿" + A + " X\n")
+        self.assertEqual(flags[A], ("X", ""))
+
+    def test_flags_dict_is_optional(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "playlists.txt"
+            p.write_text(f"{A}P\n", encoding="utf-8")
+            self.assertEqual(dl.load_ids(p), [A])
+
+    def test_order_follows_the_file(self):
+        ids, _, _ = self.read(f"{C}\n{A}X\n{B}\n")
+        self.assertEqual(ids, [C, A, B])
+
+
 if __name__ == "__main__":
     unittest.main()

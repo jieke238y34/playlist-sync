@@ -1093,8 +1093,9 @@ def load_ids(path, flags=None):
             pid, rest = m.group(1), line[m.end():]
         else:
             cleaned = line.strip("\"'` ,;")
-            pid = re.split(r"[?\s,;=]", cleaned)[0]
-            rest = cleaned[len(pid):]
+            tok = re.split(r"[?\s,;=]", cleaned)[0]
+            pid = tok.strip("\"'`")                      # "ID", X  -> the closing quote is not part of the ID
+            rest = cleaned[len(tok):]
             if len(pid) == 23 and pid[-1].upper() in "PSX" and ID_RE.fullmatch(pid[:22]):
                 pid, rest = pid[:22], pid[22:] + " " + rest
         rest = re.sub(r"^\?\S*", "", rest.strip(" ,;")).strip(" ,;")
