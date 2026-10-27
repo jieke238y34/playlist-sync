@@ -833,6 +833,76 @@ class GenreFromItunes(unittest.TestCase):
             self.assertEqual(dl.pick_genre([apple], rules)[1], folder, apple)
 
 
+class SecretsAreProtected(unittest.TestCase):
+    def test_redact_hides_keys_and_tokens(self):
+        for text, secret in (
+            ("GET /?method=x&api_key=abcd1234efgh5678&artist=A failed", "abcd1234efgh5678"),
+            ("token: sk_live_ABCDEFGH123456 rejected", "sk_live_ABCDEFGH123456"),
+            ("push with ghp_" + "A" * 36 + " denied", "ghp_" + "A" * 36),
+            ("github_pat_" + "B" * 40, "github_pat_" + "B" * 40),
+            ("Authorization: Bearer abcdefghijklmnop1234", "abcdefghijklmnop1234"),
+        ):
+            out = dl._redact(text)
+            self.assertNotIn(secret, out, text)
+            self.assertIn("***", out)
+
+    def test_redact_leaves_normal_text_alone(self):
+        s = "Genre repair: 132 tags written, 30 songs moved out of Other/Unknown"
+        self.assertEqual(dl._redact(s), s)
+
+    @unittest.skipIf(os.name == "nt", "file modes work differently on Windows")
+    def test_warns_when_a_file_with_a_key_is_readable_by_others(self):
+        import contextlib
+        with tempfile.TemporaryDirectory() as d:
+            cfg_file = Path(d) / "config.ini"
+            cfg_file.write_text("[genres]\nlastfm_api_key = x\n", encoding="utf-8")
+            old = dl.CONFIG_FILE
+            dl.CONFIG_FILE = cfg_file
+            self.addCleanup(setattr, dl, "CONFIG_FILE", old)
+            for mode, expect_warning in ((0o644, True), (0o600, False)):
+                os.chmod(cfg_file, mode)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    dl.warn_secret_files({"lastfm_key": "x", "genius_token": "", "cookies_file": None})
+                self.assertEqual("chmod 600" in out.getvalue(), expect_warning, oct(mode))
+
+    @unittest.skipIf(os.name == "nt", "file modes work differently on Windows")
+    def test_no_warning_when_there_is_no_secret(self):
+        import contextlib
+        with tempfile.TemporaryDirectory() as d:
+            cfg_file = Path(d) / "config.ini"
+            cfg_file.write_text("[genres]\nlastfm_api_key =\n", encoding="utf-8")
+            os.chmod(cfg_file, 0o644)
+            old = dl.CONFIG_FILE
+            dl.CONFIG_FILE = cfg_file
+            self.addCleanup(setattr, dl, "CONFIG_FILE", old)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                dl.warn_secret_files({"lastfm_key": "", "genius_token": "", "cookies_file": None})
+            self.assertEqual(out.getvalue(), "")
+
+    def test_no_secret_in_the_files_of_the_repository(self):
+        "A key, token or private key committed by mistake fails the tests (and so CI)."
+        import re as _re
+        bad = _re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}\b|\bgithub_pat_[A-Za-z0-9_]{30,}\b|\bAKIA[0-9A-Z]{16}\b"
+                          r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+                          r"|^\s*(?:lastfm_api_key|genius_token)\s*=\s*[A-Za-z0-9]{8,}\s*$", _re.I | _re.M)
+        for f in list(HERE.glob("*.py")) + list(HERE.glob("*.md")) + list(HERE.glob("*.ini")) \
+                + list(HERE.glob("*.txt")) + list((HERE / ".github").rglob("*.yml")) + list((HERE / "tests").glob("*.py")):
+            if f.name in ("config.ini", "playlists.txt", "genre_overrides.txt", "playlist_groups.txt"):
+                continue                                  # personal files, ignored by git
+            text = f.read_text(encoding="utf-8", errors="replace")
+            # this file builds fake tokens on purpose
+            if f.name == "test_dl.py":
+                text = _re.sub(r'"(?:ghp_|github_pat_)"\s*\+\s*"[A-Z]"\s*\*\s*\d+', "", text)
+            self.assertIsNone(bad.search(text), f"something that looks like a secret is in {f}")
+
+    def test_ci_runs_with_read_only_permissions(self):
+        wf = (HERE / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+        self.assertIn("contents: read", wf)
+        self.assertIn("persist-credentials: false", wf)
+
+
 class SpotdlPatch(unittest.TestCase):
     "The code injected into spotDL cannot run here (no spotDL), so check it parses and keeps its key parts."
 

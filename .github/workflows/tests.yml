@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read          # the tests only read the code; the job token gets no write access
+
 jobs:
   test:
     name: Python ${{ matrix.python }} on ${{ matrix.os }}
@@ -15,6 +18,8 @@ jobs:
         python: ["3.10", "3.12", "3.14"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}

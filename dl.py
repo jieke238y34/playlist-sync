@@ -440,6 +440,41 @@ def cprint(text=""):
     print(colorize_line(text))
 
 
+_SECRET_RES = (
+    re.compile(r"(?i)((?:api_?key|token|secret|password|passwd|authorization|sessionid|sid)\s*[=:]\s*)[^\s&\"',;]+"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b|\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}"),
+)
+
+
+def _redact(text):
+    "Hide anything that looks like a key, token or password before text goes to the screen or dl.log."
+    s = str(text)
+    s = _SECRET_RES[2].sub(r"\1***", s)              # "Bearer <token>" first, so "Authorization: Bearer x" is covered
+    s = _SECRET_RES[1].sub("***", s)
+    return _SECRET_RES[0].sub(r"\1***", s)
+
+
+def warn_secret_files(cfg):
+    """Warn (never change anything) when a file that holds a key or a login can be read by other
+    users of this computer: config.ini with an API key or token, and the YouTube cookies file."""
+    if IS_WIN:
+        return
+    files = []
+    if CONFIG_FILE.is_file() and (cfg.get("lastfm_key") or cfg.get("genius_token")):
+        files.append(CONFIG_FILE)
+    cookies = cfg.get("cookies_file")
+    if cookies and Path(cookies).is_file():
+        files.append(Path(cookies))
+    for f in files:
+        try:
+            loose = f.stat().st_mode & 0o077
+        except OSError:
+            continue
+        if loose:
+            cprint(f"WARNING: {f} holds a key or a login and other users can read it. Fix:  chmod 600 \"{f}\"")
+
+
 LINK_ID_RE = re.compile(r"playlist[/:]([A-Za-z0-9]{22})")   # link or spotify: URI
 CHILD_ENV = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1")
 
@@ -3111,7 +3146,7 @@ def repair_genres(cfg, dry_run=False):
             except (AttributeError, TypeError, KeyError):   # a reply that is not the shape we expect
                 continue
             except (urllib.error.URLError, OSError, ValueError) as e:
-                print(f"  {src} is busy or unreachable ({str(e)[:50]}). The rest waits for the next run.")
+                print(f"  {src} is busy or unreachable ({_redact(e)[:50]}). The rest waits for the next run.")
                 break
             cache[k] = {"tags": tags[:8], "ts": now, "src": src}
             looked += 1
@@ -3794,6 +3829,7 @@ def run_sorter(py, dry_run=False):
 def main():
     create_missing_files()
     cfg = load_config()
+    warn_secret_files(cfg)
     ids = load_ids(cfg["playlists_file"])
     if not ids:
         sys.exit(f"No valid playlist IDs in {cfg['playlists_file']}")
