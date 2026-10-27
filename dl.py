@@ -1321,6 +1321,22 @@ class Eta:
                 f"{self.pos}/{len(self.todo)} | {self.done} of {cur_new} new songs | ~{per:.0f} s/song (rough){guessed}")
 
 
+def fd_report(pid):
+    "One line: how many file handles a process holds, by kind (Linux only; '' elsewhere or if it is gone)."
+    try:
+        kinds = {}
+        for fd in os.listdir(f"/proc/{pid}/fd"):
+            try:
+                t = os.readlink(f"/proc/{pid}/fd/{fd}")
+            except OSError:
+                continue
+            k = t.split(":")[0] if t.startswith(("socket:", "pipe:", "anon_inode:")) else ("file" if t.startswith("/") else "other")
+            kinds[k] = kinds.get(k, 0) + 1
+        return "FD-WATCH " + str(sum(kinds.values())) + " " + " ".join(f"{k}={v}" for k, v in sorted(kinds.items()))
+    except OSError:
+        return ""
+
+
 def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
     """Run spotDL. Copy output to screen and log. Stop it if too many block errors.
     marks: if given, gets the DL-OK lines of finished downloads (not shown, not logged).
@@ -1331,7 +1347,14 @@ def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
                          stderr=subprocess.STDOUT, text=True,
                          encoding="utf-8", errors="replace")
     try:
+        next_fd = 0
         for line in p.stdout:
+            if time.time() >= next_fd:               # every minute: the handle count goes to dl.log only
+                next_fd = time.time() + 60
+                rep = fd_report(p.pid)
+                if rep:
+                    log.write(f"[{datetime.now():%H:%M}] {rep}\n")
+                    log.flush()
             eta_line = on_line(line) if on_line else None
             if line.startswith("DL-OK ") or line.startswith("DL-PLAN "):
                 if marks is not None and line.startswith("DL-OK "):
