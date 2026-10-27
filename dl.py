@@ -1425,7 +1425,8 @@ def fd_report_group(pgid):
         if not name.isdigit():
             continue
         try:
-            stat = open(f"/proc/{name}/stat", encoding="utf-8", errors="replace").read()
+            with open(f"/proc/{name}/stat", encoding="utf-8", errors="replace") as fh:
+                stat = fh.read()
             head, rest = stat.rsplit(")", 1)
             if int(rest.split()[2]) != pgid:          # field 5 of /proc/pid/stat: the process group
                 continue
@@ -1450,6 +1451,7 @@ def fd_report_group(pgid):
 
 
 NOFILE_MARK = "Out of file handles (Errno 24)"    # run_playlist puts this in its block lines
+_LOG_LOCK = threading.Lock()                       # the main loop and the handle watcher both write dl.log
 
 
 def _stop(p, force=False):
@@ -1506,18 +1508,20 @@ def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
     p = subprocess.Popen(cmd, cwd=cwd, env=CHILD_ENV, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True,
                          encoding="utf-8", errors="replace", start_new_session=not IS_WIN)
-    stop_watch = threading.Event()
+    stop_watch, watcher = threading.Event(), None
     if not IS_WIN:
         def _watch():                                # every minute, even while spotDL is silent
             while not stop_watch.wait(60):
                 rep = fd_report_group(p.pid) or fd_report(p.pid)
                 if rep:
                     try:
-                        log.write(f"[{datetime.now():%H:%M}] {rep}\n")
-                        log.flush()
+                        with _LOG_LOCK:
+                            log.write(f"[{datetime.now():%H:%M}] {rep}\n")
+                            log.flush()
                     except (OSError, ValueError):    # the log was closed under us: stop quietly
                         return
-        threading.Thread(target=_watch, daemon=True).start()
+        watcher = threading.Thread(target=_watch, daemon=True)
+        watcher.start()
     try:
         for line in p.stdout:
             eta_line = on_line(line) if on_line else None
@@ -1529,8 +1533,9 @@ def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
                 continue
             body = line.rstrip("\r\n")
             sys.stdout.write(colorize_line(body) + line[len(body):])
-            log.write(line)
-            log.flush()
+            with _LOG_LOCK:
+                log.write(line)
+                log.flush()
             if "Errno 24" in line:                   # out of file handles: every request fails from here on
                 nofile += 1
                 if nofile >= 5:
@@ -1550,6 +1555,8 @@ def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
         raise
     finally:
         stop_watch.set()
+        if watcher is not None:
+            watcher.join(2)                          # it may be mid-scan: do not close the log under it
         try:
             try:
                 if not _wait_unreaped(p, 15):
@@ -2921,7 +2928,7 @@ def _web_json(url, headers=None, tries=5):
             wait = 0
             if retry:
                 try:                                  # the service says how long to wait
-                    wait = min(int(e.headers.get("Retry-After", "")), 60)
+                    wait = max(0, min(int(e.headers.get("Retry-After", "")), 60))
                 except (TypeError, ValueError):
                     pass
             e.close()                                 # an HTTPError holds its socket until closed
@@ -3017,7 +3024,7 @@ def repair_genres(cfg, dry_run=False):
     todo = [k for k in sorted(targets, key=lambda k: -len(targets[k]))
             if k not in cache or stale(cache[k])]
     batch = todo[:max(0, cfg["gen_limit"])]
-    looked = 0
+    looked = bad400 = 0
     if batch and not dry_run:
         src = "Last.fm" if cfg["lastfm_key"] else "MusicBrainz"
         print(f"Genre repair: asking {src} about {len(batch)} of {len(todo)} artists "
@@ -3027,17 +3034,24 @@ def repair_genres(cfg, dry_run=False):
             try:
                 tags = _gr_lastfm(name, cfg["lastfm_key"]) if cfg["lastfm_key"] else _gr_musicbrainz(name)
             except urllib.error.HTTPError as e:
-                if e.code in (400, 404):              # this one name is refused: remember it and go on
+                if e.code == 404:                     # not found: remember it and go on
                     cache[k] = {"tags": [], "ts": now, "src": src}
                     looked += 1
+                    bad400 = 0
+                    continue
+                if e.code == 400 and bad400 < 2:      # this one name was refused. Not cached: a bad key would
+                    bad400 += 1                       # refuse them all, and then three in a row stop the run
                     continue
                 print(f"  {src} is busy or unreachable (HTTP {e.code}). The rest waits for the next run.")
                 break
+            except (AttributeError, TypeError, KeyError):   # a reply that is not the shape we expect
+                continue
             except (urllib.error.URLError, OSError, ValueError) as e:
                 print(f"  {src} is busy or unreachable ({str(e)[:50]}). The rest waits for the next run.")
                 break
             cache[k] = {"tags": tags[:8], "ts": now, "src": src}
             looked += 1
+            bad400 = 0
             time.sleep(0.3 if cfg["lastfm_key"] else 1.1)
         try:
             cache_file.write_text(json.dumps(cache), encoding="utf-8")

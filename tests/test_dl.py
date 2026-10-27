@@ -1,11 +1,22 @@
 """Tests for dl.py. They check the pure logic (no network, no spotDL, no audio files).
 Run:  python -m unittest discover -s tests -v
 """
+import contextlib
+import email.message
+import http.client
 import importlib.util
+import io
+import json
+import os
 import re
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("dl", HERE / "dl.py")
@@ -754,6 +765,234 @@ class SpotdlPatch(unittest.TestCase):
     def test_view_count_lookup_and_login_fallback_are_patched(self):
         self.assertIn("_AP.get_views = _views", dl.SPOTDL_PATCH)
         self.assertIn("_need_login", dl.SPOTDL_PATCH)
+
+
+class WebJsonRetries(unittest.TestCase):
+    """_web_json with urlopen replaced and sleep made instant."""
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"ok": 1}'
+
+    class TrackedError(urllib.error.HTTPError):
+        closed = 0
+
+        def close(self):
+            type(self).closed += 1
+            super().close()
+
+    def run_web(self, script):
+        "script: exceptions to raise or Resp objects to return, one per call."
+        calls, sleeps = [], []
+        items = list(script)
+
+        def fake_open(req, timeout=None):
+            calls.append(req)
+            it = items.pop(0)
+            if isinstance(it, BaseException):
+                raise it
+            return it
+        with mock.patch.object(dl.urllib.request, "urlopen", fake_open), \
+                mock.patch.object(dl.time, "sleep", sleeps.append):
+            try:
+                result, err = dl._web_json("http://x.invalid/a"), None
+            except Exception as e:
+                result, err = None, e
+        return result, err, len(calls), sleeps
+
+    def http_err(self, code, retry_after=None):
+        h = email.message.Message()
+        if retry_after is not None:
+            h["Retry-After"] = retry_after
+        return self.TrackedError("http://x.invalid/a", code, "msg", h, io.BytesIO(b""))
+
+    def test_503_with_retry_after_waits_that_long_closes_socket_and_succeeds(self):
+        self.TrackedError.closed = 0
+        result, err, n, sleeps = self.run_web([self.http_err(503, "7"), self.Resp()])
+        self.assertIsNone(err)
+        self.assertEqual(result, {"ok": 1})
+        self.assertEqual(n, 2)
+        self.assertEqual(sleeps, [7])
+        self.assertEqual(self.TrackedError.closed, 1, "HTTPError socket leaked")
+
+    def test_503_without_retry_after_uses_default_backoff(self):
+        result, err, n, sleeps = self.run_web([self.http_err(503), self.Resp()])
+        self.assertEqual(result, {"ok": 1})
+        self.assertEqual(sleeps, [4])
+
+    def test_retry_after_is_capped_at_a_minute(self):
+        _, _, _, sleeps = self.run_web([self.http_err(429, "9999"), self.Resp()])
+        self.assertEqual(sleeps, [60])
+
+    def test_404_raises_without_retry_and_closes_socket(self):
+        self.TrackedError.closed = 0
+        _, err, n, sleeps = self.run_web([self.http_err(404), self.Resp()])
+        self.assertIsInstance(err, urllib.error.HTTPError)
+        self.assertEqual(err.code, 404)
+        self.assertEqual(n, 1)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(self.TrackedError.closed, 1)
+
+    def test_503_forever_gives_up_after_five_tries_and_closes_every_socket(self):
+        self.TrackedError.closed = 0
+        _, err, n, _ = self.run_web([self.http_err(503, "1") for _ in range(5)])
+        self.assertIsInstance(err, urllib.error.HTTPError)
+        self.assertEqual(n, 5)
+        self.assertEqual(self.TrackedError.closed, 5)
+
+    def test_incomplete_read_becomes_oserror_after_retries(self):
+        _, err, n, _ = self.run_web([http.client.IncompleteRead(b"ab") for _ in range(5)])
+        self.assertIsInstance(err, OSError)
+        self.assertNotIsInstance(err, urllib.error.HTTPError)
+        self.assertEqual(n, 5)
+
+    def test_bad_status_line_becomes_oserror_after_retries(self):
+        _, err, n, _ = self.run_web([http.client.BadStatusLine("junk") for _ in range(5)])
+        self.assertIsInstance(err, OSError)
+        self.assertEqual(n, 5)
+
+    def test_bad_reply_then_good_reply_succeeds(self):
+        result, err, n, _ = self.run_web([http.client.IncompleteRead(b""), self.Resp()])
+        self.assertIsNone(err)
+        self.assertEqual(result, {"ok": 1})
+
+
+class RepairGenresWebErrors(unittest.TestCase):
+    """repair_genres with a damaged cache entry and with the lookup refusing one artist."""
+
+    def run_repair(self, artists, cache, lookup):
+        out = {}
+        with tempfile.TemporaryDirectory() as d:
+            music, state = Path(d) / "Music", Path(d) / "state"
+            recs = []
+            for i, (artist, n) in enumerate(artists):
+                for j in range(n):
+                    f = music / "Other" / f"s{i}_{j}.mp3"
+                    f.parent.mkdir(parents=True, exist_ok=True)
+                    f.write_bytes(MPEG_FRAME * 5)
+                    recs.append(song(f.stem, artist=artist, path=str(f), genre=""))
+            state.mkdir()
+            (state / "genre-cache.json").write_text(json.dumps(cache), encoding="utf-8")
+            cfg = {"music_dir": music, "state_dir": state, "gen_limit": 10, "lastfm_key": ""}
+            asked = []
+
+            def fake_mb(name):
+                asked.append(name)
+                return lookup(name)
+            with mock.patch.object(dl, "_pl_library", lambda m, s, mf: recs), \
+                    mock.patch.object(dl, "_gr_musicbrainz", fake_mb), \
+                    mock.patch.object(dl.time, "sleep", lambda s: None), \
+                    contextlib.redirect_stdout(io.StringIO()) as buf:
+                dl.repair_genres(cfg)
+            out["asked"], out["stdout"] = asked, buf.getvalue()
+            out["cache"] = json.loads((state / "genre-cache.json").read_text(encoding="utf-8"))
+            out["tree"] = sorted(str(p.relative_to(music)) for p in music.rglob("*") if p.is_file())
+        return out
+
+    def test_cache_entry_without_tags_key_does_not_crash(self):
+        cache = {"band": {"ts": time.time(), "src": "MusicBrainz"}}
+        out = self.run_repair([("Band", 1)], cache, lambda n: self.fail("asked the web"))
+        self.assertEqual(out["asked"], [])
+        self.assertEqual(out["tree"], ["Other/s0_0.mp3"], "song moved on no evidence")
+
+    def test_old_cache_entry_without_tags_key_is_asked_again(self):
+        cache = {"band": {"ts": 1, "src": "MusicBrainz"}}
+        out = self.run_repair([("Band", 1)], cache, lambda n: ["pop"])
+        self.assertEqual(out["asked"], ["Band"])
+
+    def refuse(self, code):
+        err = urllib.error.HTTPError("http://x.invalid", code, "refused", {}, io.BytesIO(b""))
+        self.addCleanup(err.close)
+        return err
+
+    def test_http_404_caches_empty_tags_and_continues_with_next_artist(self):
+        def lookup(name):
+            if name == "Bad":
+                raise self.refuse(404)
+            return ["pop"]
+        out = self.run_repair([("Bad", 2), ("Good", 1)], {}, lookup)
+        self.assertEqual(out["asked"], ["Bad", "Good"], out["stdout"])
+        self.assertEqual(out["cache"][dl._dd_artist("Bad")]["tags"], [])
+        self.assertEqual(out["cache"][dl._dd_artist("Good")]["tags"], ["pop"])
+
+    def test_http_400_for_one_artist_continues_with_next_and_is_not_cached(self):
+        def lookup(name):
+            if name == "Bad":
+                raise self.refuse(400)
+            return ["pop"]
+        out = self.run_repair([("Bad", 2), ("Good", 1)], {}, lookup)
+        self.assertEqual(out["asked"], ["Bad", "Good"], out["stdout"])
+        self.assertNotIn(dl._dd_artist("Bad"), out["cache"])
+        self.assertEqual(out["cache"][dl._dd_artist("Good")]["tags"], ["pop"])
+
+    def test_three_http_400_in_a_row_stop_the_run(self):
+        def lookup(name):
+            raise self.refuse(400)
+        out = self.run_repair([("A1", 4), ("B2", 3), ("C3", 2), ("D4", 1)], {}, lookup)
+        self.assertEqual(len(out["asked"]), 3, out["stdout"])
+        self.assertEqual(out["cache"], {})
+
+    def test_http_500_stops_batch_and_does_not_cache_the_artist(self):
+        def lookup(name):
+            raise self.refuse(500)
+        out = self.run_repair([("Bad", 2), ("Good", 1)], {}, lookup)
+        self.assertEqual(out["asked"], ["Bad"])
+        self.assertNotIn(dl._dd_artist("Bad"), out["cache"])
+
+
+class DedupeProbeFreshFiles(unittest.TestCase):
+    def probe(self, age):
+        def broken(path, easy=True):
+            raise ValueError("cannot parse")
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "a.mp3"
+            f.write_bytes(b"not audio")
+            if age:
+                t = time.time() - age
+                os.utime(f, (t, t))
+            return dl._dd_probe(broken, f)
+
+    def test_unparseable_file_written_just_now_is_false_not_broken(self):
+        self.assertIs(self.probe(0), False)
+
+    def test_unparseable_file_older_than_five_minutes_is_none(self):
+        self.assertIsNone(self.probe(3600))
+
+    def test_missing_file_is_false(self):
+        self.assertIs(dl._dd_probe(lambda p, easy=True: None, Path("/nonexistent-zz/a.mp3")), False)
+
+
+@unittest.skipUnless(os.path.isdir("/proc/self/fd"), "/proc is not available")
+class FdReportGroup(unittest.TestCase):
+    def test_report_for_live_process_group(self):
+        code = ("import sys,time\n"
+                "fs=[open(sys.argv[1]) for _ in range(3)]\n"
+                "print('ready',flush=True)\n"
+                "time.sleep(30)\n")
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "f.txt"
+            target.write_text("x")
+            p = subprocess.Popen([sys.executable, "-c", code, str(target)], stdout=subprocess.PIPE,
+                                 text=True, start_new_session=True)
+            try:
+                self.assertEqual(p.stdout.readline().strip(), "ready")
+                rep = dl.fd_report_group(p.pid)
+            finally:
+                p.kill()
+                p.wait()
+                p.stdout.close()
+        self.assertTrue(rep.startswith("FD-WATCH"), rep)
+        self.assertIn("processes", rep)
+        self.assertIn("file=", rep)
+
+    def test_unused_group_id_gives_empty_string(self):
+        self.assertEqual(dl.fd_report_group(2**22 + 7), "")
 
 
 if __name__ == "__main__":
