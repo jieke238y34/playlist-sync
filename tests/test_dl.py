@@ -783,6 +783,60 @@ class PlannedRestart(unittest.TestCase):
         self.assertLessEqual(dl._fd_recycle_at(), 600)
 
 
+class GenreRepairSpeed(unittest.TestCase):
+    def test_throttle_spaces_requests_across_threads(self):
+        import threading
+        gate = dl._Throttle(0.15)
+        stamps = []
+        def hit():
+            gate.wait()
+            stamps.append(time.time())
+        ts = [threading.Thread(target=hit) for _ in range(4)]
+        t0 = time.time()
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        stamps.sort()
+        self.assertGreaterEqual(stamps[-1] - t0, 0.4)                 # 4 requests, 3 gaps of 0.15 s
+        self.assertTrue(all(b - a >= 0.1 for a, b in zip(stamps, stamps[1:])))
+
+    def test_musicbrainz_needs_one_request_when_the_search_carries_the_tags(self):
+        reply = {"artists": [{"id": "x", "name": "Radiohead", "score": 100,
+                              "tags": [{"name": "alternative rock", "count": 9}, {"name": "rock", "count": 3}]}]}
+        with mock.patch.object(dl, "_web_json", return_value=reply) as m, mock.patch.object(dl.time, "sleep"):
+            self.assertEqual(dl._gr_musicbrainz("Radiohead"), ["alternative rock", "rock"])
+            self.assertEqual(m.call_count, 1)
+
+    def test_musicbrainz_asks_again_only_when_the_search_has_no_tags(self):
+        search = {"artists": [{"id": "x", "name": "Radiohead", "score": 100}]}
+        full = {"genres": [{"name": "art rock", "count": 5}], "tags": []}
+        with mock.patch.object(dl, "_web_json", side_effect=[search, full]) as m, mock.patch.object(dl.time, "sleep"):
+            self.assertEqual(dl._gr_musicbrainz("Radiohead"), ["art rock"])
+            self.assertEqual(m.call_count, 2)
+
+    @unittest.skipUnless(HAVE_MUTAGEN, "mutagen is not installed (repair_genres needs it)")
+    def test_another_song_by_the_artist_decides_without_any_web_request(self):
+        with tempfile.TemporaryDirectory() as d:
+            music, state = Path(d) / "Music", Path(d) / "state"
+            a = music / "Other" / "new.mp3"
+            b = music / "Jazz" / "old.mp3"
+            for f in (a, b):
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_bytes(MPEG_FRAME * 5)
+            state.mkdir()
+            recs = [song("new", artist="Miles Davis", path=str(a), genre=""),
+                    song("old", artist="Miles Davis", path=str(b), genre="Jazz")]
+            cfg = {"music_dir": music, "state_dir": state, "gen_limit": 10, "lastfm_key": ""}
+            with mock.patch.object(dl, "_pl_library", lambda m, s, mf: recs), \
+                    mock.patch.object(dl, "_gr_lookup", side_effect=AssertionError("no web request expected")), \
+                    mock.patch.object(dl.time, "sleep", lambda s: None), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                dl.repair_genres(cfg)
+            self.assertTrue((music / "Jazz" / "new.mp3").exists())
+            self.assertFalse(a.exists())
+
+
 class GenreFromItunes(unittest.TestCase):
     "iTunes is the free second source for artists MusicBrainz knows nothing about."
 
@@ -1042,6 +1096,7 @@ class RepairGenresWebErrors(unittest.TestCase):
                 return lookup(name)
             with mock.patch.object(dl, "_pl_library", lambda m, s, mf: recs), \
                     mock.patch.object(dl, "_gr_musicbrainz", fake_mb), \
+                    mock.patch.object(dl, "_gr_itunes", lambda n: []), \
                     mock.patch.object(dl.time, "sleep", lambda s: None), \
                     contextlib.redirect_stdout(io.StringIO()) as buf:
                 dl.repair_genres(cfg)

@@ -3015,17 +3015,40 @@ def _web_json(url, headers=None, tries=5):
             raise
 
 
+class _Throttle:
+    "Lets one request through every `gap` seconds, however many threads ask (each source has a speed limit)."
+
+    def __init__(self, gap):
+        self.gap, self.lock, self.next = gap, threading.Lock(), 0.0
+
+    def wait(self):
+        with self.lock:
+            now = time.time()
+            delay = max(0.0, self.next - now)
+            self.next = max(now, self.next) + self.gap
+        if delay:
+            time.sleep(delay)
+
+
+_MB_GATE = _Throttle(1.1)                            # MusicBrainz: one request a second
+_IT_GATE = _Throttle(2.0)                            # iTunes: roughly 20-30 a minute
+_LF_GATE = _Throttle(0.3)                            # Last.fm
+
+
 def _gr_musicbrainz(artist):
     "Genre names of an artist from MusicBrainz, most voted first. [] if it is not found."
     want = _dd_artist(artist)
+    _MB_GATE.wait()
     d = _web_json("https://musicbrainz.org/ws/2/artist/?query="
                   + urllib.parse.quote('artist:"' + artist + '"') + "&fmt=json&limit=3", MB_UA)
     hit = next((a for a in d.get("artists", [])
                 if a.get("score", 0) >= 90 and _dd_artist(a.get("name", "")) == want), None)
     if hit is None:
         return []
-    time.sleep(1.1)                                  # MusicBrainz allows one request a second
-    full = _web_json("https://musicbrainz.org/ws/2/artist/" + hit["id"] + "?inc=genres+tags&fmt=json", MB_UA)
+    full = hit
+    if not hit.get("tags") and not hit.get("genres"):  # the search reply usually carries the tags: one request
+        _MB_GATE.wait()
+        full = _web_json("https://musicbrainz.org/ws/2/artist/" + hit["id"] + "?inc=genres+tags&fmt=json", MB_UA)
     out = []
     for group in (full.get("genres", []), full.get("tags", [])):
         out += [x["name"] for x in sorted(group, key=lambda x: -x.get("count", 0)) if x.get("name")]
@@ -3033,6 +3056,7 @@ def _gr_musicbrainz(artist):
 
 
 def _gr_lastfm(artist, key):
+    _LF_GATE.wait()
     d = _web_json("https://ws.audioscrobbler.com/2.0/?method=artist.gettoptags&format=json&api_key="
                   + urllib.parse.quote(key) + "&artist=" + urllib.parse.quote(artist))
     return [t["name"] for t in d.get("toptags", {}).get("tag", []) if int(t.get("count", 0) or 0) >= 20]
@@ -3047,6 +3071,7 @@ def _gr_itunes(artist):
     if _ITUNES_OFF:
         return []
     want = _dd_artist(artist)
+    _IT_GATE.wait()
     try:
         d = _web_json("https://itunes.apple.com/search?entity=musicArtist&limit=5&term="
                       + urllib.parse.quote(artist), {"Accept": "application/json"}, tries=2)
@@ -3065,8 +3090,7 @@ def _gr_lookup(name, key):
     "Genre tags for one artist: Last.fm with a key, else MusicBrainz; iTunes when that knows nothing."
     tags = _gr_lastfm(name, key) if key else _gr_musicbrainz(name)
     if not tags and not _ITUNES_OFF:
-        time.sleep(1.5)                              # iTunes allows roughly 20 requests a minute
-        tags = _gr_itunes(name)
+        tags = _gr_itunes(name)                      # waits for its own turn (_IT_GATE)
     return tags
 
 
@@ -3120,47 +3144,79 @@ def repair_genres(cfg, dry_run=False):
         cache = {}
     now = time.time()
     stale = lambda e: (not e.get("tags")) and now - e.get("ts", 0) > GR_RETRY_DAYS * 86400
+    # The best answer is in the library: another song by the same artist that already sits in a real
+    # genre folder. No web request, and it follows your own folders.
+    seen = {}
+    for r in recs:
+        rel = Path(r["p"]).relative_to(music_dir).parts
+        top = rel[0] if len(rel) > 1 else ""
+        key = _dd_artist(r["artist"])
+        if key in targets and r["genre"] and top and top not in GR_DIRS and not top.startswith(("_", ".")) \
+                and pick_genre([r["genre"]], rules)[1]:
+            seen.setdefault(key, {})[r["genre"]] = seen.setdefault(key, {}).get(r["genre"], 0) + 1
+    local = {k: [max(v, key=v.get)] for k, v in seen.items()}
     todo = [k for k in sorted(targets, key=lambda k: -len(targets[k]))
             if k not in cache or stale(cache[k])]
+    todo = [k for k in todo if k not in local]       # answered by the library itself: no web needed
     batch = todo[:max(0, cfg["gen_limit"])]
     looked = bad400 = 0
-    if batch and not dry_run:
-        src = "Last.fm" if cfg["lastfm_key"] else "MusicBrainz"
-        print(f"Genre repair: asking {src} about {len(batch)} of {len(todo)} artists "
-              f"({n_songs} songs need a genre)...")
-        for k in batch:
-            name = targets[k][0][0]["artist"].split(";")[0].strip()
-            try:
-                tags = _gr_lookup(name, cfg["lastfm_key"])
-            except urllib.error.HTTPError as e:
-                if e.code == 404:                     # not found: remember it and go on
-                    cache[k] = {"tags": [], "ts": now, "src": src}
-                    looked += 1
-                    bad400 = 0
-                    continue
-                if e.code == 400 and bad400 < 2:      # this one name was refused. Not cached: a bad key would
-                    bad400 += 1                       # refuse them all, and then three in a row stop the run
-                    continue
-                print(f"  {src} is busy or unreachable (HTTP {e.code}). The rest waits for the next run.")
-                break
-            except (AttributeError, TypeError, KeyError):   # a reply that is not the shape we expect
-                continue
-            except (urllib.error.URLError, OSError, ValueError) as e:
-                print(f"  {src} is busy or unreachable ({_redact(e)[:50]}). The rest waits for the next run.")
-                break
-            cache[k] = {"tags": tags[:8], "ts": now, "src": src}
-            looked += 1
-            bad400 = 0
-            time.sleep(0.3 if cfg["lastfm_key"] else 1.1)
+
+    def save_cache():                                # whole file, swapped in at once: never half written
         try:
-            cache_file.write_text(json.dumps(cache), encoding="utf-8")
+            tmp = cache_file.with_name(cache_file.name + ".part")
+            tmp.write_text(json.dumps(cache), encoding="utf-8")
+            os.replace(tmp, cache_file)
         except OSError:
             pass
+
+    if batch and not dry_run:
+        src = "Last.fm" if cfg["lastfm_key"] else "MusicBrainz + iTunes"
+        print(f"Genre repair: {len(local)} artists answered by your own library, asking {src} about "
+              f"{len(batch)} of {len(todo)} others ({n_songs} songs need a genre)...")
+        from concurrent.futures import ThreadPoolExecutor
+
+        def one(k):
+            name = targets[k][0][0]["artist"].split(";")[0].strip()
+            return _gr_lookup(name, cfg["lastfm_key"])
+
+        # The sources have their own speed limits (see _Throttle), so a few lookups run side by side:
+        # while MusicBrainz waits for its next turn, iTunes answers another artist.
+        with ThreadPoolExecutor(3) as ex:
+            futs = [(k, ex.submit(one, k)) for k in batch]
+            for k, fut in futs:
+                try:
+                    tags = fut.result()
+                except urllib.error.HTTPError as e:
+                    if e.code == 404:                 # not found: remember it and go on
+                        cache[k] = {"tags": [], "ts": now, "src": src}
+                        looked += 1
+                        bad400 = 0
+                        continue
+                    if e.code == 400 and bad400 < 2:  # this one name was refused. Not cached: a bad key would
+                        bad400 += 1                   # refuse them all, and then three in a row stop the run
+                        continue
+                    print(f"  {src} is busy or unreachable (HTTP {e.code}). The rest waits for the next run.")
+                    for _, g in futs:
+                        g.cancel()
+                    break
+                except (AttributeError, TypeError, KeyError):   # a reply that is not the shape we expect
+                    continue
+                except (urllib.error.URLError, OSError, ValueError) as e:
+                    print(f"  {src} is busy or unreachable ({_redact(e)[:50]}). The rest waits for the next run.")
+                    for _, g in futs:
+                        g.cancel()
+                    break
+                cache[k] = {"tags": tags[:8], "ts": now, "src": src}
+                looked += 1
+                bad400 = 0
+                if looked % 25 == 0:                  # an interrupted run keeps what it has learned
+                    save_cache()
+        save_cache()
     tagged = moved = unknown = 0
     preview = []
     log_lines = []
     for k, items in targets.items():
-        entry = cache.get(k)
+        entry = {"tags": local[k]} if k in local else cache.get(k)
         tag, folder = pick_genre(entry.get("tags") or [], rules) if entry else (None, None)
         if not folder:
             unknown += len(items)
@@ -3194,7 +3250,8 @@ def repair_genres(cfg, dry_run=False):
             f.write("\n".join(log_lines) + "\n")
     pending = len([k for k in todo if k not in cache])
     if dry_run:
-        fixable = sum(len(targets[k]) for k in targets if cache.get(k) and pick_genre(cache[k].get("tags") or [], rules)[1])
+        fixable = sum(len(targets[k]) for k in targets
+                      if (k in local or cache.get(k)) and pick_genre(local.get(k) or cache[k].get("tags") or [], rules)[1])
         print(f"Genre repair (preview): {n_songs} songs need a genre. {fixable} can be fixed from answers already "
               f"saved. {len(todo)} artists still have to be asked (up to {cfg['gen_limit']} per run).")
         for line in preview[:8]:
