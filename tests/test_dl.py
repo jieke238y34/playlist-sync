@@ -363,7 +363,7 @@ class OutOfHandles(unittest.TestCase):
         code = "for _ in range(50): print('OSError: [Errno 24] Too many open files', flush=True)"
         (rc, hit, lines), _ = self.run_cmd(code)
         self.assertTrue(hit)
-        self.assertIn("Too many open files", lines)
+        self.assertEqual(lines, [dl.NOFILE_MARK])
 
     def test_a_few_errno_24_lines_do_not_stop_it(self):
         code = "for _ in range(3): print('OSError: [Errno 24] Too many open files', flush=True)\nprint('done')"

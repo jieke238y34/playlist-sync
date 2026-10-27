@@ -1337,15 +1337,31 @@ def fd_report(pid):
         return ""
 
 
+NOFILE_MARK = "Out of file handles (Errno 24)"    # run_playlist puts this in its block lines
+
+
+def _stop(p, force=False):
+    "Stop spotDL and what it started (yt-dlp, ffmpeg). On Linux/macOS they share its process group."
+    import signal
+    try:
+        if IS_WIN:
+            (p.kill if force else p.terminate)()
+        else:
+            os.killpg(p.pid, signal.SIGKILL if force else signal.SIGTERM)
+    except OSError:
+        pass
+
+
 def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
     """Run spotDL. Copy output to screen and log. Stop it if too many block errors.
     marks: if given, gets the DL-OK lines of finished downloads (not shown, not logged).
     on_line: if given, called with every line. It may return an ETA line to show (screen only).
-    Returns (exit code, stopped by us, block-error lines)."""
+    Returns (exit code, stopped by us, block-error lines). When spotDL ran out of file handles
+    the block lines are [NOFILE_MARK]: a fresh process fixes that, so it is not a block."""
     block_lines, hit, nofile = [], False, 0
     p = subprocess.Popen(cmd, cwd=cwd, env=CHILD_ENV, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True,
-                         encoding="utf-8", errors="replace")
+                         encoding="utf-8", errors="replace", start_new_session=not IS_WIN)
     try:
         next_fd = 0
         for line in p.stdout:
@@ -1369,27 +1385,27 @@ def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
             if "Errno 24" in line:                   # out of file handles: every request fails from here on
                 nofile += 1
                 if nofile >= 5:
-                    print(colorize_line("Out of file handles (Errno 24). Restarting spotDL to free them."))
-                    p.terminate()
+                    print(colorize_line(NOFILE_MARK + ". Stopping spotDL; the playlist runs again in a fresh process."))
+                    _stop(p)
                     hit = True
-                    block_lines.append("Too many open files")
+                    block_lines = [NOFILE_MARK]
                     break
             if is_block(line):
                 block_lines.append(line.rstrip())
                 if len(block_lines) >= max_block:
                     hit = True
-                    p.terminate()
+                    _stop(p)
                     break
-    except KeyboardInterrupt:
-        p.terminate()
+    except BaseException:                            # Ctrl+C, or an error in on_line: leave nothing running
+        _stop(p)
         raise
-    try:
-        p.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        p.kill()
-        p.wait()
     finally:
-        p.stdout.close()                             # the pipe stays open after an early stop otherwise
+        try:
+            p.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            _stop(p, force=True)
+            p.wait()
+        p.stdout.close()
     return p.returncode, hit, block_lines
 
 
@@ -3690,6 +3706,12 @@ def main():
             marks = []
             eta.begin_playlist(n, pid)
             rc, hit, block_lines = run_playlist(cmd, music, log, cfg["max_block"], marks, eta.line)
+            if block_lines == [NOFILE_MARK]:         # not a block: a fresh process has its handles back
+                say(f"spotDL ran out of file handles on {pid}. Running the playlist again once.")
+                time.sleep(5)
+                rc, hit, block_lines = run_playlist(cmd, music, log, cfg["max_block"], marks, eta.line)
+                if block_lines == [NOFILE_MARK]:     # still failing: now it counts as a failure
+                    block_lines = ["spotDL ran out of file handles twice in a row (Errno 24)"]
             eta.end_playlist()
             if upgrade_on:
                 queue_upgrades(state, marks)
