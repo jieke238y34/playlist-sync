@@ -406,11 +406,15 @@ _DIM_START = ("Playlist files", "Skipped", "Skipping", "Found ", "Processing que
 _WARN_START = ("SoundCloud failed", "No close match", "Kept the YouTube", "NOTE", "Note:", "Fallback")
 
 
+_TIME_PREFIX_RE = re.compile(r"^\[\d\d:\d\d\]\s*")
+_PASS_LINE_RE = re.compile(r"Pass \d")
+
+
 def colorize_line(line):
     "Colour one line of output by what it says. Lines that already have colour are left alone."
     if not COLOR_ON or "\033" in line:
         return line
-    t = re.sub(r"^\[\d\d:\d\d\]\s*", "", line.strip())
+    t = _TIME_PREFIX_RE.sub("", line.strip())
     if not t:
         return line
     if t.startswith(_WARN_START) or t.startswith("ETA ") or "WARNING" in t:
@@ -422,7 +426,7 @@ def colorize_line(line):
         kind = "ok"
     elif t.startswith(_DIM_START):
         kind = "dim"
-    elif t.startswith("---") or re.match(r"Pass \d", t):
+    elif t.startswith("---") or _PASS_LINE_RE.match(t):
         kind = "bold"
     else:
         return line
@@ -1408,6 +1412,43 @@ def fd_report(pid):
         return ""
 
 
+def fd_report_group(pgid):
+    """Like fd_report, but for spotDL AND everything it started (yt-dlp, ffmpeg, deno): all processes
+    of that process group. The line ends with the process count and the biggest holder, so a leak
+    shows WHICH program grows. '' if /proc is not there or the group is gone."""
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return ""
+    kinds, procs, top = {}, 0, ("", 0)
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            stat = open(f"/proc/{name}/stat", encoding="utf-8", errors="replace").read()
+            head, rest = stat.rsplit(")", 1)
+            if int(rest.split()[2]) != pgid:          # field 5 of /proc/pid/stat: the process group
+                continue
+            comm = head.split("(", 1)[1]
+            fds = os.listdir(f"/proc/{name}/fd")
+        except (OSError, ValueError, IndexError):
+            continue
+        procs += 1
+        if len(fds) > top[1]:
+            top = (comm, len(fds))
+        for fd in fds:
+            try:
+                t = os.readlink(f"/proc/{name}/fd/{fd}")
+            except OSError:
+                continue
+            k = t.split(":")[0] if t.startswith(("socket:", "pipe:", "anon_inode:")) else ("file" if t.startswith("/") else "other")
+            kinds[k] = kinds.get(k, 0) + 1
+    if not procs:
+        return ""
+    return ("FD-WATCH " + str(sum(kinds.values())) + " " + " ".join(f"{k}={v}" for k, v in sorted(kinds.items()))
+            + f" | {procs} processes, most: {top[0]} {top[1]}")
+
+
 NOFILE_MARK = "Out of file handles (Errno 24)"    # run_playlist puts this in its block lines
 
 
@@ -1465,15 +1506,20 @@ def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
     p = subprocess.Popen(cmd, cwd=cwd, env=CHILD_ENV, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True,
                          encoding="utf-8", errors="replace", start_new_session=not IS_WIN)
-    try:
-        next_fd = 0
-        for line in p.stdout:
-            if time.time() >= next_fd:               # every minute: the handle count goes to dl.log only
-                next_fd = time.time() + 60
-                rep = fd_report(p.pid)
+    stop_watch = threading.Event()
+    if not IS_WIN:
+        def _watch():                                # every minute, even while spotDL is silent
+            while not stop_watch.wait(60):
+                rep = fd_report_group(p.pid) or fd_report(p.pid)
                 if rep:
-                    log.write(f"[{datetime.now():%H:%M}] {rep}\n")
-                    log.flush()
+                    try:
+                        log.write(f"[{datetime.now():%H:%M}] {rep}\n")
+                        log.flush()
+                    except (OSError, ValueError):    # the log was closed under us: stop quietly
+                        return
+        threading.Thread(target=_watch, daemon=True).start()
+    try:
+        for line in p.stdout:
             eta_line = on_line(line) if on_line else None
             if line.startswith("DL-OK ") or line.startswith("DL-PLAN "):
                 if marks is not None and line.startswith("DL-OK "):
@@ -1503,6 +1549,7 @@ def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
         _stop(p)
         raise
     finally:
+        stop_watch.set()
         try:
             try:
                 if not _wait_unreaped(p, 15):
@@ -2007,6 +2054,14 @@ def _dd_artist(artist):
     return " ".join(re.findall(r"[^\W_]+", first))
 
 
+def _just_written(path, seconds=300):
+    "True if the file changed in the last few minutes (a download may still be writing it)."
+    try:
+        return time.time() - path.stat().st_mtime < seconds
+    except OSError:
+        return True
+
+
 def _dd_probe(mutagen_file, path):
     "Facts about one song file. None = broken file. False = could not look right now."
     try:
@@ -2015,10 +2070,10 @@ def _dd_probe(mutagen_file, path):
     except OSError:
         return False                             # locked or busy right now: look again next time
     except Exception:
-        return None
+        return False if _just_written(path) else None
     try:
         if audio is None or audio.info is None:
-            return None
+            return False if _just_written(path) else None
         tags = audio.tags or {}
 
         def one(key):
@@ -2033,7 +2088,7 @@ def _dd_probe(mutagen_file, path):
                 "title": one("title"), "album": one("album"), "genre": one("genre"), "date": one("date"),
                 "url": _spotify_url(mutagen_file, path) or ""}
     except Exception:
-        return None
+        return False if _just_written(path) else None
 
 
 def _dd_has_cover(mutagen_file, path):
@@ -2854,17 +2909,31 @@ MB_UA = {"User-Agent": "dl.py-playlist-sync/1.0 ( https://github.com/jieke238y34
          "Accept": "application/json"}
 
 
-def _web_json(url, headers=None, tries=3):
-    "GET a URL and read JSON. Waits and retries when the service is busy."
+def _web_json(url, headers=None, tries=5):
+    "GET a URL and read JSON. Waits and retries when the service is busy (429/503 wait longer each time)."
+    import http.client
     for n in range(tries):
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers=headers or {}), timeout=25) as r:
                 return json.loads(r.read().decode("utf-8", "replace"))
         except urllib.error.HTTPError as e:
-            if e.code in (429, 503) and n < tries - 1:
-                time.sleep(4 * (n + 1))
+            retry = e.code in (429, 503) and n < tries - 1
+            wait = 0
+            if retry:
+                try:                                  # the service says how long to wait
+                    wait = min(int(e.headers.get("Retry-After", "")), 60)
+                except (TypeError, ValueError):
+                    pass
+            e.close()                                 # an HTTPError holds its socket until closed
+            if retry:
+                time.sleep(wait or 4 * (n + 1))
                 continue
             raise
+        except http.client.HTTPException as e:       # half-read or malformed reply: the caller handles OSError
+            if n < tries - 1:
+                time.sleep(2)
+                continue
+            raise OSError(f"bad reply from {urllib.parse.urlsplit(url).netloc}: {e!r}") from e
         except (urllib.error.URLError, OSError, ValueError):
             if n < tries - 1:
                 time.sleep(2)
@@ -2944,7 +3013,7 @@ def repair_genres(cfg, dry_run=False):
     except (OSError, ValueError):
         cache = {}
     now = time.time()
-    stale = lambda e: (not e["tags"]) and now - e.get("ts", 0) > GR_RETRY_DAYS * 86400
+    stale = lambda e: (not e.get("tags")) and now - e.get("ts", 0) > GR_RETRY_DAYS * 86400
     todo = [k for k in sorted(targets, key=lambda k: -len(targets[k]))
             if k not in cache or stale(cache[k])]
     batch = todo[:max(0, cfg["gen_limit"])]
@@ -2957,6 +3026,13 @@ def repair_genres(cfg, dry_run=False):
             name = targets[k][0][0]["artist"].split(";")[0].strip()
             try:
                 tags = _gr_lastfm(name, cfg["lastfm_key"]) if cfg["lastfm_key"] else _gr_musicbrainz(name)
+            except urllib.error.HTTPError as e:
+                if e.code in (400, 404):              # this one name is refused: remember it and go on
+                    cache[k] = {"tags": [], "ts": now, "src": src}
+                    looked += 1
+                    continue
+                print(f"  {src} is busy or unreachable (HTTP {e.code}). The rest waits for the next run.")
+                break
             except (urllib.error.URLError, OSError, ValueError) as e:
                 print(f"  {src} is busy or unreachable ({str(e)[:50]}). The rest waits for the next run.")
                 break
@@ -2972,7 +3048,7 @@ def repair_genres(cfg, dry_run=False):
     log_lines = []
     for k, items in targets.items():
         entry = cache.get(k)
-        tag, folder = pick_genre(entry["tags"], rules) if entry else (None, None)
+        tag, folder = pick_genre(entry.get("tags") or [], rules) if entry else (None, None)
         if not folder:
             unknown += len(items)
             continue
@@ -3005,7 +3081,7 @@ def repair_genres(cfg, dry_run=False):
             f.write("\n".join(log_lines) + "\n")
     pending = len([k for k in todo if k not in cache])
     if dry_run:
-        fixable = sum(len(targets[k]) for k in targets if cache.get(k) and pick_genre(cache[k]["tags"], rules)[1])
+        fixable = sum(len(targets[k]) for k in targets if cache.get(k) and pick_genre(cache[k].get("tags") or [], rules)[1])
         print(f"Genre repair (preview): {n_songs} songs need a genre. {fixable} can be fixed from answers already "
               f"saved. {len(todo)} artists still have to be asked (up to {cfg['gen_limit']} per run).")
         for line in preview[:8]:
