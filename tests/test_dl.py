@@ -749,6 +749,40 @@ class LoadIdsFlags(unittest.TestCase):
         self.assertEqual(ids, [C, A, B])
 
 
+@unittest.skipUnless(os.path.isdir("/proc/self/fd"), "/proc is not available")
+class PlannedRestart(unittest.TestCase):
+    "spotDL leaks open files slowly: run_playlist restarts it between two songs when the count is high."
+
+    def run_child(self, code, recycle_at, seconds=0.2):
+        old = (dl.FD_RECYCLE, dl.FD_WATCH_SECONDS)
+        dl.FD_RECYCLE, dl.FD_WATCH_SECONDS = recycle_at, seconds
+        out, sys.stdout = sys.stdout, io.StringIO()
+        try:
+            return dl.run_playlist([sys.executable, "-c", code], os.getcwd(), io.StringIO(), 8)
+        finally:
+            sys.stdout = out
+            dl.FD_RECYCLE, dl.FD_WATCH_SECONDS = old
+
+    def test_many_open_files_restart_after_a_finished_song(self):
+        code = ("import os,time\nfs=[open(os.devnull) for _ in range(60)]\n"
+                "for i in range(100):\n    print('Downloaded \"s%d\": u' % i, flush=True); time.sleep(0.2)\n")
+        t = time.time()
+        rc, hit, lines = self.run_child(code, recycle_at=30)
+        self.assertTrue(hit)
+        self.assertEqual(lines, [dl.RECYCLE_MARK])
+        self.assertLess(time.time() - t, 15)
+
+    def test_few_open_files_never_restart(self):
+        code = "import time\nfor i in range(6):\n    print('Downloaded \"s%d\": u' % i, flush=True); time.sleep(0.1)\n"
+        rc, hit, lines = self.run_child(code, recycle_at=10 ** 6)
+        self.assertFalse(hit)
+        self.assertEqual(lines, [])
+
+    def test_restart_point_is_sane(self):
+        self.assertGreaterEqual(dl._fd_recycle_at(), 200)
+        self.assertLessEqual(dl._fd_recycle_at(), 600)
+
+
 class SpotdlPatch(unittest.TestCase):
     "The code injected into spotDL cannot run here (no spotDL), so check it parses and keeps its key parts."
 

@@ -29,6 +29,9 @@ COMMANDS
     python dl.py --genres          fill in missing genres from MusicBrainz/Last.fm and move songs out of
                                     Other/Unknown. Add --dry-run to preview.
     python dl.py --lyrics          look for lyrics files (.lrc / .txt) for songs in the library (off in config by default)
+    python dl.py --add             put every downloaded song into its genre folder, look up songs
+                                   without a genre, refresh the playlist files (not during a download)
+    python dl.py --status          is a download running, how many songs, errors, open-file trend
     python dl.py --schedule daily  run dl.py every night at 03:00 (or weekly). --schedule status, --unschedule
     python dl.py --ego             a short portrait of your library in words
     python dl.py --gaps            which playlist songs are missing from your library, and why
@@ -862,8 +865,10 @@ playlist_files = yes
 # group, or write your own groups in playlist_groups.txt (see [paths]).
 merge_similar = yes
 
-# Folder for the playlist files, inside your music folder. A full path also works.
-folder = Playlists
+# Folder for the playlist files, inside your music folder. A dot (.) puts them straight into the
+# music folder, next to the genre folders (the default). A name such as Playlists makes a subfolder.
+# A full path also works.
+folder = .
 
 # yes = also make "smart" playlists from your tags, in Playlists/Smart: one per genre folder, decade,
 # language (by the alphabet of the title) and favourite artist (10+ songs). Only lists with
@@ -1112,7 +1117,7 @@ def load_config():
         "genius_token": cp.get("lyrics", "genius_token", fallback="").strip(),
         "pl_files": yes_no("playlist_files", True, "playlists"),
         "pl_merge": yes_no("merge_similar", True, "playlists"),
-        "pl_folder": cp.get("playlists", "folder", fallback="Playlists").strip().strip("\"'") or "Playlists",
+        "pl_folder": cp.get("playlists", "folder", fallback=".").strip().strip("\"'") or ".",
         "groups_file": path("playlist_groups_file", HERE / "playlist_groups.txt"),
         "dd_preview": yes_no("preview_at_end", True, "dedupe"),
         "dd_fingerprint": yes_no("fingerprint", False, "dedupe"),
@@ -1451,7 +1456,25 @@ def fd_report_group(pgid):
 
 
 NOFILE_MARK = "Out of file handles (Errno 24)"    # run_playlist puts this in its block lines
+RECYCLE_MARK = "Restarting spotDL (open files high)"   # likewise: a planned restart, not a failure
 _LOG_LOCK = threading.Lock()                       # the main loop and the handle watcher both write dl.log
+FD_WATCH_SECONDS = 60                              # how often the handle count is taken
+
+
+def _fd_recycle_at():
+    """Open-file count at which spotDL is restarted between two songs: half the system limit, but
+    never more than 600. spotDL leaks a few handles per hour; a restart gives them all back."""
+    try:
+        import resource
+        soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+        if soft == resource.RLIM_INFINITY or soft < 0:
+            soft = 1 << 20
+    except (ImportError, OSError, ValueError):
+        soft = 1024
+    return max(200, min(600, soft // 2))
+
+
+FD_RECYCLE = _fd_recycle_at()
 
 
 def _stop(p, force=False):
@@ -1508,11 +1531,14 @@ def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
     p = subprocess.Popen(cmd, cwd=cwd, env=CHILD_ENV, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True,
                          encoding="utf-8", errors="replace", start_new_session=not IS_WIN)
-    stop_watch, watcher = threading.Event(), None
+    stop_watch, watcher, recycle = threading.Event(), None, threading.Event()
     if not IS_WIN:
         def _watch():                                # every minute, even while spotDL is silent
-            while not stop_watch.wait(60):
+            while not stop_watch.wait(FD_WATCH_SECONDS):
                 rep = fd_report_group(p.pid) or fd_report(p.pid)
+                m = re.match(r"FD-WATCH (\d+)", rep or "")
+                if m and int(m.group(1)) > FD_RECYCLE:
+                    recycle.set()                    # the main loop restarts spotDL after the next finished song
                 if rep:
                     try:
                         with _LOG_LOCK:
@@ -1536,6 +1562,12 @@ def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
             with _LOG_LOCK:
                 log.write(line)
                 log.flush()
+            if recycle.is_set() and line.startswith("Downloaded"):    # between two songs: nothing is half done
+                print(colorize_line(RECYCLE_MARK + ". It carries on right after."))
+                _stop(p)
+                hit = True
+                block_lines.append(RECYCLE_MARK)
+                break
             if "Errno 24" in line:                   # out of file handles: every request fails from here on
                 nofile += 1
                 if nofile >= 5:
@@ -3915,6 +3947,14 @@ def main():
             marks = []
             eta.begin_playlist(n, pid)
             rc, hit, block_lines = run_playlist(cmd, music, log, cfg["max_block"], marks, eta.line)
+            restarts = 0
+            while RECYCLE_MARK in block_lines and restarts < 200:    # planned restart: carry on where it stopped
+                restarts += 1
+                say(f"Restarting spotDL on {pid} to give back open files (restart {restarts}).")
+                time.sleep(2)
+                rc, hit, block_lines = run_playlist(cmd, music, log, cfg["max_block"], marks, eta.line)
+            if RECYCLE_MARK in block_lines:          # 200 restarts and still not done: stop here, a later pass continues
+                block_lines = [l for l in block_lines if l != RECYCLE_MARK] or ["too many planned restarts"]
             if NOFILE_MARK in block_lines:           # not a block: a fresh process has its handles back
                 say(f"spotDL ran out of file handles on {pid}. Running the playlist again once.")
                 time.sleep(5)
@@ -3993,6 +4033,79 @@ def main():
         run_inner(py, "--lyrics-inner")
 
 
+def _running_dl():
+    "PIDs of other dl.py download runs on this computer (Linux: reads /proc). [] if none or unknown."
+    out = []
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for name in names:
+        if not name.isdigit() or int(name) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{name}/cmdline", "rb") as fh:
+                argv = fh.read().decode("utf-8", "replace").split("\0")
+        except OSError:
+            continue
+        if (len(argv) > 1 and os.path.basename(argv[0]).startswith("python")
+                and os.path.basename(argv[1]) == "dl.py"
+                and not any(a.endswith("-inner") or a in ("--status", "--add") for a in argv[2:])):
+            out.append(int(name))
+    return out
+
+
+def show_status(cfg):
+    """dl.py --status: is a download running, and how is it going? Reads dl.log only; changes nothing."""
+    logf = cfg["state_dir"] / "dl.log"
+    pids = _running_dl()
+    cprint(("A download is running (PID " + ", ".join(map(str, pids)) + ").") if pids
+           else "No download is running right now.")
+    try:
+        size = logf.stat().st_size
+        with logf.open("rb") as fh:
+            fh.seek(max(0, size - 3_000_000))                 # the last few MB are plenty
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+        age = (time.time() - logf.stat().st_mtime) / 60
+    except OSError:
+        cprint(f"No log yet ({logf}).")
+        return
+    start = max((i for i, l in enumerate(lines) if re.match(r"\[\d\d:\d\d\] Pass \d", l)), default=0)
+    run = lines[start:]
+    count = lambda *needles: sum(1 for l in run if any(n in l for n in needles))
+    cprint(f"Log: {logf}  (last line {age:.0f} min ago{'; quiet for a while' if pids and age > 15 else ''})")
+    cprint(f"Since '{run[0][:70].strip() if run else '-'}':")
+    cprint(f"  songs downloaded:        {sum(1 for l in run if l.startswith('Downloaded'))}")
+    cprint(f"  login-only videos:       {count('wants a login')} swapped for another result, "
+           f"{count('Sign in to confirm', 'Please sign in')} still failed")
+    cprint(f"  no close match / DRM:    {count('none close enough')} / {count('DRM protected')}")
+    cprint(f"  out of file handles:     {count('Errno 24', 'Out of file handles')}")
+    cprint(f"  stopped by the script:   {count('stopped by script')}")
+    fd = [l for l in run if "FD-WATCH" in l]
+    if fd:
+        nums = [int(m.group(1)) for l in fd for m in [re.search(r"FD-WATCH (\d+)", l)] if m]
+        cprint(f"  open files (FD-WATCH):   latest {nums[-1]}, highest {max(nums)}, first {nums[0]} "
+               f"({len(nums)} samples). A number that keeps climbing is a leak.")
+        cprint("  latest: " + fd[-1].split("] ", 1)[-1][:110])
+    last = [l for l in run if l.strip()][-1:] or [""]
+    cprint("Last log line: " + last[0].strip()[:110])
+
+
+def add_songs(py, cfg):
+    """dl.py --add: put every downloaded song where it belongs. Loose songs go into their genre
+    folder, songs without a genre are looked up (up to genre_repair_limit artists per run), and
+    the playlist files are refreshed."""
+    say = cprint
+    say("Sorting loose songs into genre folders...")
+    run_sorter(py)
+    say("Looking up songs that have no genre...")
+    run_inner(py, "--genres-inner")
+    if playlists_wanted(cfg) and (cfg["state_dir"] / "playlist-cache.json").is_file():
+        say("Updating playlist files...")
+        run_inner(py, "--playlists-inner", "--cached")
+    say("Done. Run  dl.py --status  to see the download, or  dl.py --add  again to look up more genres.")
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     try:
@@ -4002,13 +4115,23 @@ if __name__ == "__main__":
         known = {"-h", "--help", "--sort", "--dry-run", "--upgrade", "--dedupe", "--report",
                  "--sort-inner", "--seed-inner", "--upgrade-inner", "--dedupe-inner", "--report-only",
                  "--no-ask", "--colors", "--themes", "--playlists", "--playlists-inner", "--cached", "--genres", "--genres-inner", "--gaps", "--gaps-inner",
-                 "--lyrics", "--lyrics-inner", "--ego", "--ego-inner", "--schedule", "--unschedule"}
+                 "--lyrics", "--lyrics-inner", "--ego", "--ego-inner", "--schedule", "--unschedule",
+                 "--add", "--status"}
         if "-h" in args or "--help" in args:
             print(__doc__)
         elif set(rest) - known or ("--dry-run" in args and not {"--sort", "--sort-inner", "--dedupe", "--dedupe-inner", "--playlists", "--playlists-inner", "--genres", "--genres-inner", "--lyrics", "--lyrics-inner"} & set(args)):
-            sys.exit("Usage: dl.py [--sort | --dedupe | --playlists | --genres | --lyrics [--dry-run]] [--gaps] [--report] [--upgrade]\n"
+            sys.exit("Usage: dl.py [--add | --status | --sort | --dedupe | --playlists | --genres | --lyrics [--dry-run]] [--gaps] [--report] [--upgrade]\n"
                      "              [--ego] [--schedule daily|weekly|status|off] [--unschedule] [--colors [NAME]] [--themes] [--help]\n"
                      "(unknown option, or --dry-run used without --sort)")
+        elif "--status" in args:                # is a download running, how is it going (reads the log only)
+            show_status(load_config())
+        elif "--add" in args:                   # sort every downloaded song into its genre, look up missing genres
+            create_missing_files(need_playlists=False)
+            _cfg = load_config()
+            if _running_dl():
+                sys.exit("A download is running. Run  dl.py --add  after it, or stop it first "
+                         "(it already sorts new songs after each playlist).")
+            add_songs(ensure_spotdl(_cfg["venv_dir"]), _cfg)
         elif "--sort-inner" in args:            # runs inside the private venv (has mutagen)
             _cfg = load_config()
             sort_library(_cfg["music_dir"], _cfg["overrides_file"], "--dry-run" in args)
