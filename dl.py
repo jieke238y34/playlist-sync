@@ -3943,6 +3943,14 @@ def main():
             if bad >= cfg["max_bad"]:
                 abort(f"{cfg['max_bad']} playlists in a row failed with block-type errors")
             need_gate = bool(hit or rc != 0 or n2 or block_lines)
+            if marks and (cfg["sort_after"] or playlists_wanted(cfg)):
+                try:                             # new songs reach their genre folder and the playlists now, not days later
+                    if cfg["sort_after"]:
+                        run_sorter(py)
+                    if playlists_wanted(cfg):
+                        run_inner(py, "--playlists-inner", "--cached")
+                except Exception as e:           # never let this stop the downloads
+                    say(f"Note: could not sort or update playlists after this playlist ({e}).")
             if n < len(todo):                    # no pause after the last playlist of a pass
                 say(f"Waiting {cfg['pause']} s before the next playlist (YouTube rate limit).")
                 time.sleep(cfg["pause"])
