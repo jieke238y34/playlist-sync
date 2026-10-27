@@ -335,5 +335,42 @@ class Eta(unittest.TestCase):
             self.assertTrue((Path(d) / "playlist-sizes.json").exists())
 
 
+class FdWatch(unittest.TestCase):
+    def test_report_for_this_process(self):
+        import os
+        rep = dl.fd_report(os.getpid())
+        if Path("/proc/self/fd").exists():
+            self.assertTrue(rep.startswith("FD-WATCH "), rep)
+        else:
+            self.assertEqual(rep, "")                # not Linux: no report, no crash
+
+    def test_report_for_missing_process(self):
+        self.assertEqual(dl.fd_report(2 ** 22 + 12345), "")
+
+
+class OutOfHandles(unittest.TestCase):
+    def run_cmd(self, code):
+        import io, sys
+        with tempfile.TemporaryDirectory() as d:
+            log = io.StringIO()
+            old, sys.stdout = sys.stdout, io.StringIO()
+            try:
+                return dl.run_playlist([sys.executable, "-c", code], d, log, 8), log.getvalue()
+            finally:
+                sys.stdout = old
+
+    def test_errno_24_stops_the_run(self):
+        code = "for _ in range(50): print('OSError: [Errno 24] Too many open files', flush=True)"
+        (rc, hit, lines), _ = self.run_cmd(code)
+        self.assertTrue(hit)
+        self.assertIn("Too many open files", lines)
+
+    def test_a_few_errno_24_lines_do_not_stop_it(self):
+        code = "for _ in range(3): print('OSError: [Errno 24] Too many open files', flush=True)\nprint('done')"
+        (rc, hit, lines), log = self.run_cmd(code)
+        self.assertFalse(hit)
+        self.assertIn("done", log)
+
+
 if __name__ == "__main__":
     unittest.main()

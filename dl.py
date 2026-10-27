@@ -1388,6 +1388,8 @@ def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
     except subprocess.TimeoutExpired:
         p.kill()
         p.wait()
+    finally:
+        p.stdout.close()                             # the pipe stays open after an early stop otherwise
     return p.returncode, hit, block_lines
 
 
