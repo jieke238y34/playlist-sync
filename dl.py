@@ -458,6 +458,7 @@ try:
     from spotdl.utils.formatter import create_song_title as _title
     _seen = {}
     _cache = {}
+    _fb = {}
     _NOFB = bool(__import__("os").environ.get("DL_NO_FALLBACK"))   # the SoundCloud upgrade run
     def _mark(song, url):
         "One line per finished download. dl.py reads it: Spotify link, download link, name."
@@ -523,10 +524,12 @@ try:
     def _find2(dl, song):
         provs = [p for p in dl.audio_providers if not isinstance(p, _SC)]
         if not any(isinstance(p, _YT) for p in provs):
-            st = dl.settings
-            provs.append(_YT(output_format=st["format"], cookie_file=st["cookie_file"],
-                             search_query=st["search_query"], filter_results=st["filter_results"],
-                             yt_dlp_args=st["yt_dlp_args"]))
+            if "yt" not in _fb:                      # one provider for the whole run: a new one per song leaks sockets
+                st = dl.settings
+                _fb["yt"] = _YT(output_format=st["format"], cookie_file=st["cookie_file"],
+                                search_query=st["search_query"], filter_results=st["filter_results"],
+                                yt_dlp_args=st["yt_dlp_args"])
+            provs.append(_fb["yt"])
         for p in provs:                              # strict match first
             try:
                 u = p.search(song, dl.settings["only_verified_results"])
@@ -1323,7 +1326,7 @@ def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
     marks: if given, gets the DL-OK lines of finished downloads (not shown, not logged).
     on_line: if given, called with every line. It may return an ETA line to show (screen only).
     Returns (exit code, stopped by us, block-error lines)."""
-    block_lines, hit = [], False
+    block_lines, hit, nofile = [], False, 0
     p = subprocess.Popen(cmd, cwd=cwd, env=CHILD_ENV, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True,
                          encoding="utf-8", errors="replace")
@@ -1340,6 +1343,14 @@ def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
             sys.stdout.write(colorize_line(body) + line[len(body):])
             log.write(line)
             log.flush()
+            if "Errno 24" in line:                   # out of file handles: every request fails from here on
+                nofile += 1
+                if nofile >= 5:
+                    print(colorize_line("Out of file handles (Errno 24). Restarting spotDL to free them."))
+                    p.terminate()
+                    hit = True
+                    block_lines.append("Too many open files")
+                    break
             if is_block(line):
                 block_lines.append(line.rstrip())
                 if len(block_lines) >= max_block:
