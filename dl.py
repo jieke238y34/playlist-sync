@@ -2948,9 +2948,15 @@ def build_playlists(cfg, refresh=True, dry_run=False):
                 lines.append(f"#EXTINF:{int(r['len'])},{r['artist'] or track[2]} - {r['title'] or track[1]}")
                 lines.append(rel)
         target = folder / (fname + ".m3u8")
-        part = target.with_name(target.name + ".part")
-        part.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        os.replace(part, target)
+        new_text = "\n".join(lines) + "\n"
+        try:
+            same = target.read_text(encoding="utf-8") == new_text      # most files do not change between two runs
+        except (OSError, ValueError):
+            same = False
+        if not same:
+            part = target.with_name(target.name + ".part")
+            part.write_text(new_text, encoding="utf-8")
+            os.replace(part, target)
         written.append(target.name)
         extra = f" (combines {len(members)} playlists)" if len(members) > 1 else ""
         cprint(f"  {fname}.m3u8: {linked} songs linked, {total - linked} not in the library yet{extra}")
