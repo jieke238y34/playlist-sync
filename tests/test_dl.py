@@ -431,7 +431,9 @@ class GenreFolderFromWebTags(unittest.TestCase):
         self.assertEqual(len(seen), 1)
         self.assertNotIn('"Hi"', seen[0])                # raw quotes would break out of artist:"..."
         self.assertNotIn(" ", seen[0])
-        self.assertIn("%22Hi%22", seen[0])
+        # each inner quote is backslash-escaped (%5C = \, %22 = "), and so is the trailing backslash
+        self.assertIn("%5C%22Hi%5C%22", seen[0])
+        self.assertTrue(seen[0].split("&fmt")[0].endswith("%5C%5C%22"))
 
 
 class RepairGenresMoves(unittest.TestCase):
@@ -955,6 +957,67 @@ class SecretsAreProtected(unittest.TestCase):
         wf = (HERE / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
         self.assertIn("contents: read", wf)
         self.assertIn("persist-credentials: false", wf)
+
+
+class ReviewFixes(unittest.TestCase):
+    "Fixes from the full code review."
+
+    def test_windows_taskkill_has_each_switch_once(self):
+        calls = []
+        class P:
+            pid = 4242
+        with mock.patch.object(dl, "IS_WIN", True), \
+                mock.patch.object(dl.subprocess, "run", side_effect=lambda a, **k: calls.append(a)):
+            dl._stop(P())
+            dl._stop(P(), force=True)
+        self.assertEqual(calls[0], ["taskkill", "/PID", "4242", "/T"])
+        self.assertEqual(calls[1], ["taskkill", "/PID", "4242", "/T", "/F"])
+
+    @unittest.skipUnless(HAVE_MUTAGEN, "mutagen is not installed (repair_genres needs it)")
+    def test_empty_answer_is_not_cached_while_itunes_is_switched_off(self):
+        helper = RepairGenresWebErrors("test_cache_entry_without_tags_key_does_not_crash")
+        dl._ITUNES_OFF.append(403)
+        self.addCleanup(dl._ITUNES_OFF.clear)
+        out = helper.run_repair([("Nobody Known", 1)], {}, lambda name: [])
+        self.assertEqual(out["asked"], ["Nobody Known"])
+        self.assertNotIn("nobody known", out["cache"])          # it will be asked again next run
+
+    @unittest.skipUnless(HAVE_MUTAGEN, "mutagen is not installed (repair_genres needs it)")
+    def test_empty_answer_is_cached_when_every_source_was_asked(self):
+        dl._ITUNES_OFF.clear()
+        helper = RepairGenresWebErrors("test_cache_entry_without_tags_key_does_not_crash")
+        out = helper.run_repair([("Nobody Known", 1)], {}, lambda name: [])
+        self.assertEqual(out["cache"].get("nobody known", {}).get("tags"), [])
+
+    def test_status_counts_the_whole_pass_not_the_last_playlist(self):
+        import contextlib
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d)
+            (state / "dl.log").write_text(
+                "[10:00] Pass 1: playlist 1 of 3 (aaa)\nDownloaded \"A\": u\n"
+                "[10:20] Pass 1: playlist 2 of 3 (bbb)\nDownloaded \"B\": u\nDownloaded \"C\": u\n",
+                encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), mock.patch.object(dl, "_running_dl", return_value=[]):
+                dl.show_status({"state_dir": state})
+            self.assertIn("songs downloaded:        3", out.getvalue())
+
+    def test_recycle_waits_for_five_songs(self):
+        # A system whose limit is already below the baseline must not restart spotDL after every song.
+        code = ("import os,time\nfs=[open(os.devnull) for _ in range(60)]\n"
+                "for i in range(4):\n    print('Downloaded \"s%d\": u' % i, flush=True); time.sleep(0.4)\n")
+        if not os.path.isdir("/proc/self/fd"):
+            self.skipTest("/proc is not available")
+        old = (dl.FD_RECYCLE, dl.FD_WATCH_SECONDS)
+        dl.FD_RECYCLE, dl.FD_WATCH_SECONDS = 10, 0.1
+        self.addCleanup(lambda: setattr(dl, "FD_RECYCLE", old[0]) or setattr(dl, "FD_WATCH_SECONDS", old[1]))
+        out, sys.stdout = sys.stdout, io.StringIO()
+        try:
+            rc, hit, lines = dl.run_playlist([sys.executable, "-c", code], os.getcwd(), io.StringIO(), 8)
+        finally:
+            sys.stdout = out
+        self.assertFalse(hit)                                   # only 4 songs: no restart yet
+        self.assertNotIn(dl.RECYCLE_MARK, lines)
 
 
 class SpotdlPatch(unittest.TestCase):

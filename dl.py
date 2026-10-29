@@ -1517,7 +1517,7 @@ def _stop(p, force=False):
     import signal
     try:
         if IS_WIN:                                   # no process groups: /T also ends its children
-            subprocess.run(["taskkill", "/T", "/F" if force else "/T", "/PID", str(p.pid)],
+            subprocess.run(["taskkill", "/PID", str(p.pid), "/T"] + (["/F"] if force else []),
                            capture_output=True, timeout=15)
         else:
             os.killpg(p.pid, signal.SIGKILL if force else signal.SIGTERM)
@@ -1563,10 +1563,16 @@ def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
             raise _Terminate()
         for s in (signal.SIGTERM, signal.SIGHUP):    # the child has its own session: it will not see these
             old_handlers[s] = signal.signal(s, _die)
-    p = subprocess.Popen(cmd, cwd=cwd, env=CHILD_ENV, stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, text=True,
-                         encoding="utf-8", errors="replace", start_new_session=not IS_WIN)
+    try:
+        p = subprocess.Popen(cmd, cwd=cwd, env=CHILD_ENV, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True,
+                             encoding="utf-8", errors="replace", start_new_session=not IS_WIN)
+    except BaseException:                            # e.g. the venv python is missing: give the handlers back
+        for s, h in old_handlers.items():
+            signal.signal(s, h)
+        raise
     stop_watch, watcher, recycle = threading.Event(), None, threading.Event()
+    songs = 0                                        # finished songs in this run (see the planned restart below)
     if not IS_WIN:
         def _watch():                                # every minute, even while spotDL is silent
             while not stop_watch.wait(FD_WATCH_SECONDS):
@@ -1597,7 +1603,11 @@ def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
             with _LOG_LOCK:
                 log.write(line)
                 log.flush()
-            if recycle.is_set() and line.startswith("Downloaded"):    # between two songs: nothing is half done
+            if line.startswith("Downloaded"):
+                songs += 1
+            # Between two songs nothing is half done. At least 5 songs per run: if the count is high from the
+            # start (a low system limit), restarting after every song would only loop.
+            if recycle.is_set() and line.startswith("Downloaded") and songs >= 5:
                 print(colorize_line(RECYCLE_MARK + ". It carries on right after."))
                 _stop(p)
                 hit = True
@@ -1622,10 +1632,10 @@ def run_playlist(cmd, cwd, log, max_block, marks=None, on_line=None):
         raise
     finally:
         stop_watch.set()
-        if watcher is not None:
-            watcher.join(2)                          # it may be mid-scan: do not close the log under it
         try:
             try:
+                if watcher is not None:
+                    watcher.join(2)                  # it may be mid-scan: do not close the log under it
                 if not _wait_unreaped(p, 15):
                     _stop(p, force=True)
                 # spotDL is gone but a yt-dlp/ffmpeg child may linger. The group id is still ours
@@ -2938,9 +2948,15 @@ def build_playlists(cfg, refresh=True, dry_run=False):
                 lines.append(f"#EXTINF:{int(r['len'])},{r['artist'] or track[2]} - {r['title'] or track[1]}")
                 lines.append(rel)
         target = folder / (fname + ".m3u8")
-        part = target.with_name(target.name + ".part")
-        part.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        os.replace(part, target)
+        new_text = "\n".join(lines) + "\n"
+        try:
+            same = target.read_text(encoding="utf-8") == new_text      # most files do not change between two runs
+        except (OSError, ValueError):
+            same = False
+        if not same:
+            part = target.with_name(target.name + ".part")
+            part.write_text(new_text, encoding="utf-8")
+            os.replace(part, target)
         written.append(target.name)
         extra = f" (combines {len(members)} playlists)" if len(members) > 1 else ""
         cprint(f"  {fname}.m3u8: {linked} songs linked, {total - linked} not in the library yet{extra}")
@@ -3040,7 +3056,8 @@ def _gr_musicbrainz(artist):
     want = _dd_artist(artist)
     _MB_GATE.wait()
     d = _web_json("https://musicbrainz.org/ws/2/artist/?query="
-                  + urllib.parse.quote('artist:"' + artist + '"') + "&fmt=json&limit=3", MB_UA)
+                  + urllib.parse.quote('artist:"' + artist.replace("\\", "\\\\").replace('"', '\\"') + '"')
+                  + "&fmt=json&limit=3", MB_UA)
     hit = next((a for a in d.get("artists", [])
                 if a.get("score", 0) >= 90 and _dd_artist(a.get("name", "")) == want), None)
     if hit is None:
@@ -3181,7 +3198,8 @@ def repair_genres(cfg, dry_run=False):
 
         # The sources have their own speed limits (see _Throttle), so a few lookups run side by side:
         # while MusicBrainz waits for its next turn, iTunes answers another artist.
-        with ThreadPoolExecutor(3) as ex:
+        ex = ThreadPoolExecutor(3)
+        try:
             futs = [(k, ex.submit(one, k)) for k in batch]
             for k, fut in futs:
                 try:
@@ -3206,12 +3224,16 @@ def repair_genres(cfg, dry_run=False):
                     for _, g in futs:
                         g.cancel()
                     break
+                if not tags and _ITUNES_OFF:          # iTunes was switched off (rate limit): "nothing found" is
+                    continue                          # not an answer yet, so do not remember it for 60 days
                 cache[k] = {"tags": tags[:8], "ts": now, "src": src}
                 looked += 1
                 bad400 = 0
                 if looked % 25 == 0:                  # an interrupted run keeps what it has learned
                     save_cache()
-        save_cache()
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)   # Ctrl+C must not wait for every queued lookup
+            save_cache()
     tagged = moved = unknown = 0
     preview = []
     log_lines = []
@@ -4173,9 +4195,12 @@ def _running_dl():
                 argv = fh.read().decode("utf-8", "replace").split("\0")
         except OSError:
             continue
-        if (len(argv) > 1 and os.path.basename(argv[0]).startswith("python")
-                and os.path.basename(argv[1]) == "dl.py"
-                and not any(a.endswith("-inner") or a in ("--status", "--add") for a in argv[2:])):
+        if not (argv and os.path.basename(argv[0]).startswith("python")):
+            continue
+        # python [-u -I ...] dl.py [flags]: find dl.py among the first few words
+        where = next((j for j, a in enumerate(argv[1:4], 1) if os.path.basename(a) == "dl.py"), None)
+        # A download run is plain `dl.py` (maybe --no-ask). --sort, --genres, --playlists... are other jobs.
+        if where is not None and all(a in ("", "--no-ask") for a in argv[where + 1:]):
             out.append(int(name))
     return out
 
@@ -4195,7 +4220,11 @@ def show_status(cfg):
     except OSError:
         cprint(f"No log yet ({logf}).")
         return
-    start = max((i for i, l in enumerate(lines) if re.match(r"\[\d\d:\d\d\] Pass \d", l)), default=0)
+    # The run starts at the last "Pass 1: playlist 1 of N" line, so the counts cover the whole pass and not just
+    # the current playlist ("Pass N: playlist n of m" is printed for every playlist).
+    first = [i for i, l in enumerate(lines) if re.match(r"\[\d\d:\d\d\] Pass 1: playlist 1 of ", l)]
+    start = first[-1] if first else max((i for i, l in enumerate(lines) if re.match(r"\[\d\d:\d\d\] Pass \d", l)),
+                                          default=0)
     run = lines[start:]
     count = lambda *needles: sum(1 for l in run if any(n in l for n in needles))
     cprint(f"Log: {logf}  (last line {age:.0f} min ago{'; quiet for a while' if pids and age > 15 else ''})")
